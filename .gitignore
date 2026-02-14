@@ -4,9 +4,9 @@ fortran/*.mod
 fortran/experiment_*[!.cuf]
 
 # Data files (too large for git)
-experiments/*/fields/*.bin
+*.bin
 experiments/*/runs/
-data/synthetic/*.bin
+data/synthetic/
 data/les/
 
 # Python
