@@ -188,6 +188,106 @@ contains
     end subroutine
 
     !=========================================================================
+    ! Generate gradient-coupled field: fine-scale texture is a DETERMINISTIC
+    ! function of the coarse-scale field.
+    !
+    ! This is the key insight from experiment 001: random fine structure
+    ! can't be predicted. We need the fine structure to be computable
+    ! from the coarse input.
+    !
+    ! Method:
+    !   1. Generate a coarse field (low-k modes only, random per seed)
+    !   2. Compute nonlinear features of the coarse field:
+    !      - gradient components (dC/dx, dC/dy)
+    !      - gradient magnitude |grad C|
+    !      - Laplacian (nabla^2 C)
+    !      - strain: (dC/dx)^2 - (dC/dy)^2
+    !   3. Combine these into deterministic fine-scale texture
+    !   4. High-pass filter the texture to keep only fine modes
+    !   5. fine = coarse + coupling * filtered_texture
+    !
+    ! The nonlinear combinations (products, squares) create high-frequency
+    ! content from low-frequency inputs — just like real turbulence where
+    ! the advective nonlinearity u.grad(u) generates small scales from
+    ! large scales.
+    !=========================================================================
+    subroutine generate_gradient_coupled_2d(fine_h, coarse_h, nx, ny, &
+                                            k_cutoff, coupling, seed)
+        integer, intent(in) :: nx, ny, seed
+        real(sp), intent(in) :: k_cutoff, coupling
+        real(sp), intent(out) :: fine_h(nx, ny), coarse_h(nx, ny)
+
+        ! Device arrays
+        real(sp), device, allocatable :: coarse_d(:,:), texture_d(:,:)
+        real(sp), device, allocatable :: filtered_d(:,:)
+
+        ! Host work arrays
+        real(sp), allocatable :: texture_h(:,:)
+        real(sp) :: gx, gy, lap, strain, val, max_tex
+        integer :: i, j, ip, im, jp, jm
+
+        allocate(coarse_d(nx, ny), texture_d(nx, ny), filtered_d(nx, ny))
+        allocate(texture_h(nx, ny))
+
+        ! Step 1: Generate coarse field (only low-k modes)
+        call generate_powerlaw_field_2d(coarse_d, nx, ny, -5.0_sp/3.0_sp, seed)
+        call normalize_field_2d(coarse_d, nx, ny)
+        call spectral_filter_2d(coarse_d, coarse_d, nx, ny, k_cutoff, 0)
+        coarse_h = coarse_d
+
+        ! Step 2: Build deterministic fine-scale texture from coarse gradients
+        do j = 1, ny
+            do i = 1, nx
+                ip = mod(i, nx) + 1
+                im = mod(i - 2 + nx, nx) + 1
+                jp = mod(j, ny) + 1
+                jm = mod(j - 2 + ny, ny) + 1
+
+                ! Gradient components
+                gx = (coarse_h(ip, j) - coarse_h(im, j)) * 0.5_sp
+                gy = (coarse_h(i, jp) - coarse_h(i, jm)) * 0.5_sp
+
+                ! Laplacian
+                lap = coarse_h(ip, j) + coarse_h(im, j) + &
+                      coarse_h(i, jp) + coarse_h(i, jm) - &
+                      4.0_sp * coarse_h(i, j)
+
+                ! Strain-like term (anisotropic)
+                strain = gx * gx - gy * gy
+
+                ! Nonlinear combination -> creates high-frequency content
+                ! Products of gradients naturally double the wavenumber
+                texture_h(i, j) = gx * gy + &          ! cross-gradient (doubles k)
+                                  0.5_sp * strain + &   ! anisotropic strain
+                                  0.3_sp * lap * coarse_h(i, j) + &  ! field * Laplacian
+                                  0.2_sp * (gx**2 + gy**2) * coarse_h(i, j)  ! |grad|^2 * field
+            end do
+        end do
+
+        ! Step 3: High-pass filter to keep only the fine-scale part
+        ! (the texture contains low-k artifacts from the products)
+        texture_d = texture_h
+        call spectral_filter_2d(texture_d, filtered_d, nx, ny, k_cutoff, 1)
+        texture_h = filtered_d
+
+        ! Normalize texture
+        max_tex = maxval(abs(texture_h))
+        if (max_tex > 1.0e-10_sp) then
+            texture_h = texture_h / max_tex
+        end if
+
+        ! Step 4: Construct fine field
+        do j = 1, ny
+            do i = 1, nx
+                fine_h(i, j) = coarse_h(i, j) + coupling * texture_h(i, j)
+            end do
+        end do
+
+        deallocate(coarse_d, texture_d, filtered_d)
+        deallocate(texture_h)
+    end subroutine
+
+    !=========================================================================
     ! Normalize field to zero mean, unit variance
     ! Useful for consistent comparisons across experiments
     !=========================================================================

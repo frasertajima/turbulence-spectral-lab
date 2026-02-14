@@ -1,0 +1,172 @@
+! experiment_002.cuf - Gradient-coupled fields: learnable fine structure
+!
+! Experiment 001 showed that random-phase fields have no cross-scale coupling,
+! so neural networks correctly learn to output zero. This experiment adds
+! deterministic coupling: fine-scale texture amplitude depends on coarse-scale
+! gradients (mimicking turbulent strain producing small eddies).
+!
+! We test multiple coupling strengths to find the threshold where the
+! relationship becomes learnable.
+!
+! Compile:
+!   nvfortran -cuda -gpu=cc80,cc86,cc89,cc90 -O3 -lcufft \
+!     spectral_tools.cuf synthetic_turbulence.cuf experiment_002.cuf -o experiment_002
+!
+! Run:
+!   ./experiment_002
+
+program experiment_002
+    use cudafor
+    use spectral_tools
+    use synthetic_turbulence
+    implicit none
+
+    ! Grid size
+    integer, parameter :: nx = 256, ny = 256
+
+    ! Filter cutoff
+    real(sp), parameter :: k_cutoff = 32.0_sp
+
+    ! Coupling strengths to test
+    integer, parameter :: n_couplings = 4
+    real(sp), parameter :: couplings(n_couplings) = (/0.1_sp, 0.3_sp, 0.5_sp, 1.0_sp/)
+
+    ! Training samples per coupling strength
+    integer, parameter :: n_samples = 200
+
+    ! Host arrays
+    real(sp), allocatable :: fine_h(:,:), coarse_h(:,:), residual_h(:,:)
+
+    ! Device arrays for spectrum computation
+    real(sp), device, allocatable :: field_d(:,:)
+
+    ! Spectrum arrays
+    real(sp) :: E_k(MAX_BINS), k_vals(MAX_BINS)
+    integer :: n_bins
+
+    ! Timing
+    type(cudaEvent) :: start_event, stop_event
+    real(4) :: elapsed_ms
+
+    ! Loop variables
+    integer :: c, sample, ierr
+    character(len=256) :: filename, output_dir, coupling_dir
+    character(len=32) :: coupling_str
+
+    ! Stats
+    real(sp) :: residual_rms, max_grad_corr
+
+    ! GPU info
+    type(cudaDeviceProp) :: prop
+    ierr = cudaGetDeviceProperties(prop, 0)
+
+    print *, "================================================================"
+    print *, "  Experiment 002: Gradient-Coupled Fine Structure"
+    print *, "================================================================"
+    print *, ""
+    print *, "GPU: ", trim(prop%name)
+    print *, "Grid: ", nx, "x", ny
+    print *, "Filter cutoff: k =", int(k_cutoff)
+    print *, "Coupling strengths:", couplings
+    print *, "Samples per coupling:", n_samples
+    print *, ""
+
+    ! Create output directory
+    output_dir = "../experiments/002_gradient_coupled/"
+    call execute_command_line("mkdir -p " // trim(output_dir) // "spectra")
+
+    ! Allocate
+    allocate(fine_h(nx, ny), coarse_h(nx, ny), residual_h(nx, ny))
+    allocate(field_d(nx, ny))
+
+    ierr = cudaEventCreate(start_event)
+    ierr = cudaEventCreate(stop_event)
+
+    ! ==========================================
+    ! For each coupling strength
+    ! ==========================================
+    do c = 1, n_couplings
+        write(coupling_str, '(A,I0)') "coupling_", int(couplings(c) * 100)
+        coupling_dir = trim(output_dir) // "fields_" // trim(coupling_str) // "/"
+        call execute_command_line("mkdir -p " // trim(coupling_dir))
+
+        print *, ""
+        print '(A,F5.2)', "  --- Coupling strength: ", couplings(c)
+        print *, ""
+
+        ierr = cudaEventRecord(start_event, 0)
+
+        do sample = 1, n_samples
+            ! Generate gradient-coupled pair
+            call generate_gradient_coupled_2d(fine_h, coarse_h, nx, ny, &
+                                              k_cutoff, couplings(c), &
+                                              sample * 137 + c * 1000 + 7)
+
+            ! Save pair
+            write(filename, '(A,A,I3.3,A)') trim(coupling_dir), "fine_sample_", sample, ".bin"
+            call write_field_2d(trim(filename), fine_h, nx, ny)
+
+            write(filename, '(A,A,I3.3,A)') trim(coupling_dir), "coarse_sample_", sample, ".bin"
+            call write_field_2d(trim(filename), coarse_h, nx, ny)
+
+            if (mod(sample, 50) == 0) then
+                print '(A,I4,A,I4,A)', "    Generated ", sample, " / ", n_samples, " samples"
+            end if
+        end do
+
+        ierr = cudaEventRecord(stop_event, 0)
+        ierr = cudaEventSynchronize(stop_event)
+        ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+        print '(A,F8.1,A,F5.1,A)', "    Time: ", elapsed_ms, " ms (", &
+              elapsed_ms / real(n_samples), " ms/sample)"
+
+        ! Compute and save spectra for first sample
+        call generate_gradient_coupled_2d(fine_h, coarse_h, nx, ny, &
+                                          k_cutoff, couplings(c), 42)
+        residual_h = fine_h - coarse_h
+
+        ! Fine spectrum
+        field_d = fine_h
+        call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+        write(filename, '(A,A,A,A)') trim(output_dir), "spectra/spectrum_fine_", &
+              trim(coupling_str), ".dat"
+        call write_spectrum(trim(filename), E_k, k_vals, n_bins)
+
+        ! Coarse spectrum
+        field_d = coarse_h
+        call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+        write(filename, '(A,A,A,A)') trim(output_dir), "spectra/spectrum_coarse_", &
+              trim(coupling_str), ".dat"
+        call write_spectrum(trim(filename), E_k, k_vals, n_bins)
+
+        ! Residual spectrum
+        field_d = residual_h
+        call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+        write(filename, '(A,A,A,A)') trim(output_dir), "spectra/spectrum_residual_", &
+              trim(coupling_str), ".dat"
+        call write_spectrum(trim(filename), E_k, k_vals, n_bins)
+
+        ! Print residual stats
+        residual_rms = sqrt(sum(residual_h**2) / real(nx * ny))
+        print '(A,ES12.4)', "    Residual RMS: ", residual_rms
+    end do
+
+    print *, ""
+    print *, "================================================================"
+    print *, "  Experiment 002 Complete"
+    print *, "================================================================"
+    print *, ""
+    print *, "  Output in: ", trim(output_dir)
+    print *, ""
+    print *, "  Next: train FNO/CNN on each coupling strength:"
+    print *, "    python train_fno.py --model fno --data-dir ../experiments/002_gradient_coupled/fields_coupling_10/"
+    print *, "    python train_fno.py --model fno --data-dir ../experiments/002_gradient_coupled/fields_coupling_50/"
+    print *, ""
+
+    ! Cleanup
+    deallocate(fine_h, coarse_h, residual_h, field_d)
+    ierr = cudaEventDestroy(start_event)
+    ierr = cudaEventDestroy(stop_event)
+
+end program experiment_002

@@ -20,9 +20,9 @@ LIBS = -lcufft
 MODULES = spectral_tools.o synthetic_turbulence.o
 
 # Targets
-.PHONY: all clean run_001
+.PHONY: all clean run_001 run_002
 
-all: experiment_001
+all: experiment_001 experiment_002
 
 # Module compilation
 spectral_tools.o: spectral_tools.cuf
@@ -35,11 +35,15 @@ synthetic_turbulence.o: synthetic_turbulence.cuf spectral_tools.o
 experiment_001: $(MODULES) experiment_001.cuf
 	$(FC) $(FFLAGS) $(MODULES) experiment_001.cuf -o $@ $(LIBS)
 
+experiment_002: $(MODULES) experiment_002.cuf
+	$(FC) $(FFLAGS) $(MODULES) experiment_002.cuf -o $@ $(LIBS)
+
 # Convenience targets
 run_001: experiment_001
 	./experiment_001
 
+run_002: experiment_002
+	./experiment_002
+
 clean:
-	rm -f *.o *.mod experiment_001
-	rm -f ../experiments/001_synthetic_2d/spectra/*.dat
-	rm -f ../experiments/001_synthetic_2d/fields/*.bin
+	rm -f *.o *.mod experiment_001 experiment_002
