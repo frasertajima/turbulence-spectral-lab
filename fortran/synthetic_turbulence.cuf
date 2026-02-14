@@ -1,0 +1,231 @@
+! synthetic_turbulence.cuf - Generate synthetic turbulence fields with known spectra
+!
+! This is crucial for controlled experiments: we know the ground truth,
+! so we can measure exactly how well reconstruction works.
+!
+! Generates fields with:
+!   - Kolmogorov -5/3 spectrum (3D turbulence inertial range)
+!   - Kraichnan -3 spectrum (2D turbulence enstrophy cascade)
+!   - Custom power-law spectra
+!   - Gaussian random fields with prescribed spectrum
+!
+! The idea: generate fine-resolution field, coarse-grain it, then see if
+! a neural network can recover the lost high-frequency content.
+
+module synthetic_turbulence
+    use cudafor
+    use cufft
+    use spectral_tools
+    implicit none
+
+contains
+
+    !=========================================================================
+    ! Set random seed reproducibly from an integer
+    !=========================================================================
+    subroutine set_random_seed(seed)
+        integer, intent(in) :: seed
+        integer :: seed_size, i
+        integer, allocatable :: seed_array(:)
+
+        call random_seed(size=seed_size)
+        allocate(seed_array(seed_size))
+        do i = 1, seed_size
+            seed_array(i) = seed + (i - 1) * 127
+        end do
+        call random_seed(put=seed_array)
+        deallocate(seed_array)
+    end subroutine
+
+    !=========================================================================
+    ! Generate 2D turbulence field with Kolmogorov-like spectrum
+    !
+    ! E(k) ~ k^alpha  for k_min <= k <= k_max
+    ! Default alpha = -5/3 (Kolmogorov)
+    !
+    ! Phases are random -> different realizations from different seeds
+    !=========================================================================
+    subroutine generate_powerlaw_field_2d(field_d, nx, ny, alpha, seed)
+        integer, intent(in) :: nx, ny
+        real(sp), intent(in) :: alpha  ! spectral exponent (e.g., -5.0/3.0)
+        integer, intent(in) :: seed
+        real(sp), device, intent(out) :: field_d(nx, ny)
+
+        ! Local arrays
+        complex(sp), device, allocatable :: spectrum_d(:,:)
+        complex(sp), allocatable :: spectrum_h(:,:)
+        integer :: i, j, nkx, plan, ierr
+        real(sp) :: kx, ky, k_mag, amplitude, phase
+        real(sp) :: rval
+
+        nkx = nx/2 + 1
+        allocate(spectrum_h(nkx, ny))
+        allocate(spectrum_d(nkx, ny))
+
+        ! Initialize random seed
+        call set_random_seed(seed)
+
+        ! Build spectrum on host with prescribed energy and random phases
+        spectrum_h = cmplx(0.0_sp, 0.0_sp)
+
+        do j = 1, ny
+            if (j <= ny/2 + 1) then
+                ky = real(j - 1)
+            else
+                ky = real(j - 1 - ny)
+            end if
+
+            do i = 1, nkx
+                kx = real(i - 1)
+                k_mag = sqrt(kx**2 + ky**2)
+
+                if (k_mag >= 1.0_sp .and. k_mag <= real(min(nx,ny))/2.0_sp) then
+                    ! Amplitude from power law: E(k) ~ k^alpha
+                    ! Since E(k) = |F(k)|^2 * k, amplitude ~ k^((alpha-1)/2)
+                    amplitude = k_mag ** ((alpha - 1.0_sp) / 2.0_sp)
+
+                    ! Random phase
+                    call random_number(rval)
+                    phase = TWO_PI * rval
+
+                    spectrum_h(i, j) = amplitude * cmplx(cos(phase), sin(phase))
+                end if
+            end do
+        end do
+
+        ! DC component = 0 (zero mean field)
+        spectrum_h(1, 1) = cmplx(0.0_sp, 0.0_sp)
+
+        ! Copy to device and inverse FFT
+        spectrum_d = spectrum_h
+
+        ierr = cufftPlan2d(plan, ny, nx, CUFFT_C2R)
+        ierr = cufftExecC2R(plan, spectrum_d, field_d)
+        ierr = cufftDestroy(plan)
+
+        ! Normalize
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                field_d(i, j) = field_d(i, j) / real(nx * ny)
+            end do
+        end do
+
+        deallocate(spectrum_h, spectrum_d)
+    end subroutine
+
+    !=========================================================================
+    ! Generate 2D field with Kolmogorov -5/3 spectrum
+    !=========================================================================
+    subroutine generate_kolmogorov_2d(field_d, nx, ny, seed)
+        integer, intent(in) :: nx, ny, seed
+        real(sp), device, intent(out) :: field_d(nx, ny)
+
+        call generate_powerlaw_field_2d(field_d, nx, ny, -5.0_sp/3.0_sp, seed)
+    end subroutine
+
+    !=========================================================================
+    ! Generate 2D field with Kraichnan -3 spectrum (2D enstrophy cascade)
+    !=========================================================================
+    subroutine generate_kraichnan_2d(field_d, nx, ny, seed)
+        integer, intent(in) :: nx, ny, seed
+        real(sp), device, intent(out) :: field_d(nx, ny)
+
+        call generate_powerlaw_field_2d(field_d, nx, ny, -3.0_sp, seed)
+    end subroutine
+
+    !=========================================================================
+    ! Generate multi-scale field: sum of power-law + localized features
+    !
+    ! This is more realistic than pure power-law: real turbulence has
+    ! coherent structures (vortices) superposed on broadband spectrum.
+    !=========================================================================
+    subroutine generate_multiscale_field_2d(field_d, nx, ny, alpha, n_vortices, seed)
+        integer, intent(in) :: nx, ny, n_vortices, seed
+        real(sp), intent(in) :: alpha
+        real(sp), device, intent(out) :: field_d(nx, ny)
+
+        real(sp), allocatable :: field_h(:,:)
+        integer :: v, i, j
+        real(sp) :: cx, cy, sigma, strength, r2, x, y
+        real(sp) :: rval
+
+        ! Start with power-law background
+        call generate_powerlaw_field_2d(field_d, nx, ny, alpha, seed)
+
+        ! Add Gaussian vortices on host
+        allocate(field_h(nx, ny))
+        field_h = field_d  ! copy from device
+
+        call set_random_seed(seed + 12345)
+
+        do v = 1, n_vortices
+            ! Random vortex parameters
+            call random_number(rval); cx = rval * real(nx)
+            call random_number(rval); cy = rval * real(ny)
+            call random_number(rval); sigma = 2.0_sp + rval * 10.0_sp  ! radius 2-12 cells
+            call random_number(rval); strength = (rval - 0.5_sp) * 2.0_sp  ! positive or negative
+
+            do j = 1, ny
+                do i = 1, nx
+                    x = real(i) - cx
+                    y = real(j) - cy
+                    ! Periodic wrapping
+                    if (x > real(nx)/2) x = x - real(nx)
+                    if (x < -real(nx)/2) x = x + real(nx)
+                    if (y > real(ny)/2) y = y - real(ny)
+                    if (y < -real(ny)/2) y = y + real(ny)
+
+                    r2 = x**2 + y**2
+                    field_h(i, j) = field_h(i, j) + &
+                        strength * exp(-r2 / (2.0_sp * sigma**2))
+                end do
+            end do
+        end do
+
+        field_d = field_h  ! copy back to device
+        deallocate(field_h)
+    end subroutine
+
+    !=========================================================================
+    ! Normalize field to zero mean, unit variance
+    ! Useful for consistent comparisons across experiments
+    !=========================================================================
+    subroutine normalize_field_2d(field_d, nx, ny)
+        integer, intent(in) :: nx, ny
+        real(sp), device, intent(inout) :: field_d(nx, ny)
+
+        real(sp), allocatable :: field_h(:,:)
+        real(sp) :: mean_val, std_val, sum_val, sum_sq
+        integer :: i, j, n_total
+
+        allocate(field_h(nx, ny))
+        field_h = field_d
+
+        n_total = nx * ny
+        sum_val = 0.0_sp
+        sum_sq = 0.0_sp
+
+        do j = 1, ny
+            do i = 1, nx
+                sum_val = sum_val + field_h(i, j)
+                sum_sq = sum_sq + field_h(i, j)**2
+            end do
+        end do
+
+        mean_val = sum_val / real(n_total)
+        std_val = sqrt(sum_sq / real(n_total) - mean_val**2)
+
+        if (std_val > 1.0e-10_sp) then
+            do j = 1, ny
+                do i = 1, nx
+                    field_h(i, j) = (field_h(i, j) - mean_val) / std_val
+                end do
+            end do
+        end if
+
+        field_d = field_h
+        deallocate(field_h)
+    end subroutine
+
+end module synthetic_turbulence

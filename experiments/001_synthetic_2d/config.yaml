@@ -1,0 +1,41 @@
+# Experiment 001: Synthetic 2D Spectral Filtering and Recovery
+#
+# Question: Can a small neural network recover high-frequency spectral
+#           content that was removed by low-pass filtering?
+#
+# This is the most basic test. If it fails here, more complex approaches
+# won't work either. If it succeeds, we know the problem is learnable.
+
+experiment:
+  name: "001_synthetic_2d"
+  description: "Baseline spectral super-resolution on synthetic Kolmogorov turbulence"
+
+data:
+  field_size: [256, 256]
+  spectral_exponent: -1.6667  # Kolmogorov -5/3
+  filter_cutoff_k: 32         # Equivalent to 16x coarse grid
+  n_training_samples: 100
+  n_validation_samples: 20
+
+models:
+  fno:
+    modes: 12
+    width: 32
+    n_layers: 4
+    learning_rate: 0.001
+    epochs: 100
+    batch_size: 8
+
+  cnn_baseline:
+    n_channels: 32
+    n_layers: 4
+    learning_rate: 0.001
+    epochs: 100
+    batch_size: 8
+
+evaluation:
+  metrics:
+    - mse_physical    # Mean squared error in physical space
+    - mse_spectral    # MSE of log energy spectrum
+    - max_k_recovered # Highest wavenumber within 50% accuracy
+    - energy_fraction # Total energy recovery ratio

@@ -1,0 +1,246 @@
+! experiment_001.cuf - First experiment: Can we recover filtered spectral content?
+!
+! What this does:
+!   1. Generate a 256x256 field with known Kolmogorov -5/3 spectrum
+!   2. Low-pass filter it (simulating coarse grid, cutoff at k=32)
+!   3. Compute and save spectra of both (original and filtered)
+!   4. Save the fields for Python/FNO training
+!   5. Also save the "missing" high-frequency residual
+!
+! This establishes the baseline: what does spectral filtering lose?
+! And gives us training data: (coarse, fine) pairs.
+!
+! Compile:
+!   nvfortran -cuda -gpu=cc80,cc86,cc89,cc90 -O3 -lcufft \
+!     spectral_tools.cuf synthetic_turbulence.cuf experiment_001.cuf -o experiment_001
+!
+! Run:
+!   ./experiment_001
+
+program experiment_001
+    use cudafor
+    use spectral_tools
+    use synthetic_turbulence
+    implicit none
+
+    ! Grid size - 256x256 is our "fine" resolution
+    integer, parameter :: nx = 256, ny = 256
+
+    ! Filter cutoff - modes above this are "lost" (would be k=32 on a 64x64 grid)
+    real(sp), parameter :: k_cutoff = 32.0_sp
+
+    ! Number of training samples to generate
+    integer, parameter :: n_samples = 100
+
+    ! Device arrays
+    real(sp), device, allocatable :: fine_d(:,:), coarse_d(:,:), residual_d(:,:)
+
+    ! Host arrays for I/O
+    real(sp), allocatable :: fine_h(:,:), coarse_h(:,:), residual_h(:,:)
+
+    ! Spectrum arrays
+    real(sp) :: E_k_fine(MAX_BINS), k_fine(MAX_BINS)
+    real(sp) :: E_k_coarse(MAX_BINS), k_coarse(MAX_BINS)
+    real(sp) :: E_k_residual(MAX_BINS), k_residual(MAX_BINS)
+    integer :: n_bins_fine, n_bins_coarse, n_bins_residual
+
+    ! Timing
+    type(cudaEvent) :: start_event, stop_event
+    real(4) :: elapsed_ms
+
+    ! Loop variables
+    integer :: sample, ierr, i, j
+    character(len=256) :: filename
+    character(len=256) :: output_dir
+
+    ! GPU info
+    type(cudaDeviceProp) :: prop
+    ierr = cudaGetDeviceProperties(prop, 0)
+
+    print *, "================================================================"
+    print *, "  Experiment 001: Spectral Filtering and Recovery Baseline"
+    print *, "================================================================"
+    print *, ""
+    print *, "GPU: ", trim(prop%name)
+    print *, "Grid: ", nx, "x", ny
+    print *, "Filter cutoff: k =", int(k_cutoff), &
+             " (equivalent to", int(2.0*real(nx)/k_cutoff/2.0), "x", &
+             int(2.0*real(ny)/k_cutoff/2.0), "coarse grid)"
+    print *, "Samples to generate:", n_samples
+    print *, ""
+
+    ! Create output directory
+    output_dir = "../experiments/001_synthetic_2d/"
+    call execute_command_line("mkdir -p " // trim(output_dir) // "spectra")
+    call execute_command_line("mkdir -p " // trim(output_dir) // "fields")
+
+    ! Allocate
+    allocate(fine_d(nx, ny), coarse_d(nx, ny), residual_d(nx, ny))
+    allocate(fine_h(nx, ny), coarse_h(nx, ny), residual_h(nx, ny))
+
+    ! Create timing events
+    ierr = cudaEventCreate(start_event)
+    ierr = cudaEventCreate(stop_event)
+
+    ! ==========================================
+    ! Part 1: Single sample analysis (detailed)
+    ! ==========================================
+    print *, "--- Part 1: Detailed single-sample analysis ---"
+    print *, ""
+
+    ierr = cudaEventRecord(start_event, 0)
+
+    ! Generate Kolmogorov field
+    print *, "  Generating Kolmogorov -5/3 field..."
+    call generate_kolmogorov_2d(fine_d, nx, ny, 42)
+    call normalize_field_2d(fine_d, nx, ny)
+
+    ! Compute fine spectrum
+    call compute_energy_spectrum_2d(fine_d, nx, ny, E_k_fine, k_fine, n_bins_fine)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_fine.dat", &
+                        E_k_fine, k_fine, n_bins_fine)
+
+    ! Low-pass filter (simulating coarse grid)
+    print *, "  Applying low-pass filter at k =", int(k_cutoff), "..."
+    call spectral_filter_2d(fine_d, coarse_d, nx, ny, k_cutoff, 0)
+
+    ! Compute coarse spectrum
+    call compute_energy_spectrum_2d(coarse_d, nx, ny, E_k_coarse, k_coarse, n_bins_coarse)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_coarse.dat", &
+                        E_k_coarse, k_coarse, n_bins_coarse)
+
+    ! Compute residual (the high-frequency content we want to recover)
+    ! residual = fine - coarse
+    !$cuf kernel do(2) <<<*, *>>>
+    do j = 1, ny
+        do i = 1, nx
+            residual_d(i, j) = fine_d(i, j) - coarse_d(i, j)
+        end do
+    end do
+
+    call compute_energy_spectrum_2d(residual_d, nx, ny, E_k_residual, k_residual, n_bins_residual)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_residual.dat", &
+                        E_k_residual, k_residual, n_bins_residual)
+
+    ! Save fields
+    fine_h = fine_d
+    coarse_h = coarse_d
+    residual_h = residual_d
+
+    call write_field_2d(trim(output_dir) // "fields/fine_sample_000.bin", fine_h, nx, ny)
+    call write_field_2d(trim(output_dir) // "fields/coarse_sample_000.bin", coarse_h, nx, ny)
+    call write_field_2d(trim(output_dir) // "fields/residual_sample_000.bin", residual_h, nx, ny)
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+    print *, ""
+    print *, "  Single sample analysis time:", elapsed_ms, "ms"
+    print *, ""
+
+    ! Print spectrum summary
+    print *, "  Spectrum summary (selected bins):"
+    print '(A12, A14, A14, A14)', "  k", "E_fine(k)", "E_coarse(k)", "E_resid(k)"
+    print '(A12, A14, A14, A14)', "  ---", "---------", "----------", "----------"
+    do i = 1, min(n_bins_fine, 20)
+        if (mod(i, 2) == 1 .and. k_fine(i) > 0) then
+            print '(F12.1, ES14.4, ES14.4, ES14.4)', &
+                k_fine(i), E_k_fine(i), E_k_coarse(i), E_k_residual(i)
+        end if
+    end do
+    print *, ""
+
+    ! ==========================================
+    ! Part 2: Generate training dataset
+    ! ==========================================
+    print *, "--- Part 2: Generating training dataset ---"
+    print *, ""
+
+    ierr = cudaEventRecord(start_event, 0)
+
+    do sample = 1, n_samples
+        ! Different seed for each sample -> different random phases
+        call generate_kolmogorov_2d(fine_d, nx, ny, sample * 137 + 7)
+        call normalize_field_2d(fine_d, nx, ny)
+
+        ! Low-pass filter
+        call spectral_filter_2d(fine_d, coarse_d, nx, ny, k_cutoff, 0)
+
+        ! Save pair
+        fine_h = fine_d
+        coarse_h = coarse_d
+
+        write(filename, '(A,A,I3.3,A)') trim(output_dir), "fields/fine_sample_", sample, ".bin"
+        call write_field_2d(trim(filename), fine_h, nx, ny)
+
+        write(filename, '(A,A,I3.3,A)') trim(output_dir), "fields/coarse_sample_", sample, ".bin"
+        call write_field_2d(trim(filename), coarse_h, nx, ny)
+
+        if (mod(sample, 20) == 0) then
+            print '(A,I4,A,I4,A)', "    Generated ", sample, " / ", n_samples, " samples"
+        end if
+    end do
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+    print *, ""
+    print '(A,I4,A,F8.1,A)', "  Generated ", n_samples, " training pairs in ", elapsed_ms, " ms"
+    print '(A,F6.1,A)', "  Rate: ", elapsed_ms / real(n_samples), " ms/sample"
+    print *, ""
+
+    ! ==========================================
+    ! Part 3: Test different spectral exponents
+    ! ==========================================
+    print *, "--- Part 3: Testing different spectral exponents ---"
+    print *, ""
+
+    call test_exponent(-5.0_sp/3.0_sp, "kolmogorov_5_3", output_dir)
+    call test_exponent(-3.0_sp, "kraichnan_3", output_dir)
+    call test_exponent(-2.0_sp, "slope_2", output_dir)
+    call test_exponent(-1.0_sp, "slope_1", output_dir)
+
+    print *, ""
+    print *, "================================================================"
+    print *, "  Experiment 001 Complete"
+    print *, "================================================================"
+    print *, ""
+    print *, "  Output files in: ", trim(output_dir)
+    print *, "  - spectra/   : Energy spectrum data files"
+    print *, "  - fields/    : Binary field data for Python loading"
+    print *, ""
+    print *, "  Next steps:"
+    print *, "  1. Run python/analyze_spectrum.py to plot spectra"
+    print *, "  2. Run python/train_fno.py to train super-resolution model"
+    print *, ""
+
+    ! Cleanup
+    deallocate(fine_d, coarse_d, residual_d)
+    deallocate(fine_h, coarse_h, residual_h)
+    ierr = cudaEventDestroy(start_event)
+    ierr = cudaEventDestroy(stop_event)
+
+contains
+
+    subroutine test_exponent(alpha, label, base_dir)
+        real(sp), intent(in) :: alpha
+        character(len=*), intent(in) :: label, base_dir
+        real(sp), device, allocatable :: test_d(:,:)
+        real(sp) :: E_k_test(MAX_BINS), k_test(MAX_BINS)
+        integer :: n_bins_test
+
+        allocate(test_d(nx, ny))
+        call generate_powerlaw_field_2d(test_d, nx, ny, alpha, 42)
+        call normalize_field_2d(test_d, nx, ny)
+        call compute_energy_spectrum_2d(test_d, nx, ny, E_k_test, k_test, n_bins_test)
+
+        write(filename, '(A,A,A,A)') trim(base_dir), "spectra/spectrum_", trim(label), ".dat"
+        call write_spectrum(trim(filename), E_k_test, k_test, n_bins_test)
+        print '(A,A,A,F6.2)', "  Spectrum saved: ", trim(label), "  (alpha = ", alpha, ")"
+
+        deallocate(test_d)
+    end subroutine
+
+end program experiment_001

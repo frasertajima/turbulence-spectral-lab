@@ -1,0 +1,386 @@
+! spectral_tools.cuf - Core spectral decomposition and filtering module
+!
+! Provides GPU-accelerated spectral analysis using cuFFT:
+!   - Forward/inverse FFT of 2D and 3D fields
+!   - Energy spectrum computation (radial binning)
+!   - Spectral filtering (low-pass, high-pass, band-pass)
+!   - Coarse-graining (filter then downsample)
+!
+! Compile:
+!   nvfortran -cuda -gpu=cc80,cc86,cc89,cc90 -O3 -lcufft spectral_tools.cuf -o test_spectral
+!
+! This module is the foundation: every experiment uses it.
+
+module spectral_tools
+    use cudafor
+    use cufft
+    implicit none
+
+    ! Precision control - single precision throughout for GPU performance
+    integer, parameter :: sp = 4
+    real(sp), parameter :: PI = 3.14159265358979323846_sp
+    real(sp), parameter :: TWO_PI = 2.0_sp * PI
+
+    ! Maximum spectrum bins
+    integer, parameter :: MAX_BINS = 2048
+
+contains
+
+    !=========================================================================
+    ! 2D Forward FFT: real field -> complex spectrum
+    ! Input:  field(nx, ny) - real-space data
+    ! Output: spectrum(nx/2+1, ny) - complex Fourier coefficients
+    !=========================================================================
+    subroutine fft2d_forward(field, spectrum, nx, ny)
+        integer, intent(in) :: nx, ny
+        real(sp), device, intent(in) :: field(nx, ny)
+        complex(sp), device, intent(out) :: spectrum(nx/2+1, ny)
+        integer :: plan, ierr
+
+        ierr = cufftPlan2d(plan, ny, nx, CUFFT_R2C)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftPlan2d failed, ierr=", ierr
+            return
+        end if
+
+        ierr = cufftExecR2C(plan, field, spectrum)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftExecR2C failed, ierr=", ierr
+        end if
+
+        ierr = cufftDestroy(plan)
+    end subroutine
+
+    !=========================================================================
+    ! 2D Inverse FFT: complex spectrum -> real field
+    ! Note: cuFFT inverse is unnormalized, we divide by nx*ny
+    !=========================================================================
+    subroutine fft2d_inverse(spectrum, field, nx, ny)
+        integer, intent(in) :: nx, ny
+        complex(sp), device, intent(in) :: spectrum(nx/2+1, ny)
+        real(sp), device, intent(out) :: field(nx, ny)
+        integer :: plan, ierr
+
+        ierr = cufftPlan2d(plan, ny, nx, CUFFT_C2R)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftPlan2d (inverse) failed, ierr=", ierr
+            return
+        end if
+
+        ierr = cufftExecC2R(plan, spectrum, field)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftExecC2R failed, ierr=", ierr
+        end if
+
+        ierr = cufftDestroy(plan)
+    end subroutine
+
+    !=========================================================================
+    ! 3D Forward FFT: real field -> complex spectrum
+    !=========================================================================
+    subroutine fft3d_forward(field, spectrum, nx, ny, nz)
+        integer, intent(in) :: nx, ny, nz
+        real(sp), device, intent(in) :: field(nx, ny, nz)
+        complex(sp), device, intent(out) :: spectrum(nx/2+1, ny, nz)
+        integer :: plan, ierr
+
+        ierr = cufftPlan3d(plan, nz, ny, nx, CUFFT_R2C)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftPlan3d failed, ierr=", ierr
+            return
+        end if
+
+        ierr = cufftExecR2C(plan, field, spectrum)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftExecR2C (3D) failed, ierr=", ierr
+        end if
+
+        ierr = cufftDestroy(plan)
+    end subroutine
+
+    !=========================================================================
+    ! 3D Inverse FFT: complex spectrum -> real field
+    !=========================================================================
+    subroutine fft3d_inverse(spectrum, field, nx, ny, nz)
+        integer, intent(in) :: nx, ny, nz
+        complex(sp), device, intent(in) :: spectrum(nx/2+1, ny, nz)
+        real(sp), device, intent(out) :: field(nx, ny, nz)
+        integer :: plan, ierr
+
+        ierr = cufftPlan3d(plan, nz, ny, nx, CUFFT_C2R)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftPlan3d (inverse) failed, ierr=", ierr
+            return
+        end if
+
+        ierr = cufftExecC2R(plan, spectrum, field)
+        if (ierr /= CUFFT_SUCCESS) then
+            print *, "ERROR: cufftExecC2R (3D) failed, ierr=", ierr
+        end if
+
+        ierr = cufftDestroy(plan)
+    end subroutine
+
+    !=========================================================================
+    ! Compute 2D energy spectrum E(k) via radial binning
+    ! Returns spectrum as function of wavenumber magnitude
+    !
+    ! This is the workhorse diagnostic: tells you where energy lives
+    !=========================================================================
+    subroutine compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+        integer, intent(in) :: nx, ny
+        real(sp), device, intent(in) :: field_d(nx, ny)
+        real(sp), intent(out) :: E_k(MAX_BINS), k_vals(MAX_BINS)
+        integer, intent(out) :: n_bins
+
+        ! Local
+        complex(sp), device, allocatable :: spectrum_d(:,:)
+        complex(sp), allocatable :: spectrum_h(:,:)
+        integer :: i, j, bin, nkx, nky
+        real(sp) :: kx, ky, k_mag, k_max, dk, energy
+        integer :: counts(MAX_BINS)
+
+        nkx = nx/2 + 1
+        nky = ny
+
+        allocate(spectrum_d(nkx, nky))
+        allocate(spectrum_h(nkx, nky))
+
+        ! Forward FFT
+        call fft2d_forward(field_d, spectrum_d, nx, ny)
+
+        ! Copy to host for binning
+        spectrum_h = spectrum_d
+
+        ! Determine binning
+        k_max = real(min(nx, ny)) / 2.0_sp
+        n_bins = min(int(k_max), MAX_BINS)
+        dk = k_max / real(n_bins)
+
+        E_k = 0.0_sp
+        k_vals = 0.0_sp
+        counts = 0
+
+        ! Radial binning
+        do j = 1, nky
+            if (j <= ny/2 + 1) then
+                ky = real(j - 1)
+            else
+                ky = real(j - 1 - ny)
+            end if
+
+            do i = 1, nkx
+                kx = real(i - 1)
+                k_mag = sqrt(kx**2 + ky**2)
+                bin = int(k_mag / dk) + 1
+
+                if (bin >= 1 .and. bin <= n_bins) then
+                    ! Energy = |F(k)|^2, normalized
+                    energy = real(spectrum_h(i,j))**2 + aimag(spectrum_h(i,j))**2
+                    energy = energy / real(nx * ny)**2
+
+                    ! Account for R2C symmetry: modes with kx > 0 count twice
+                    if (i > 1 .and. i < nkx) energy = 2.0_sp * energy
+
+                    E_k(bin) = E_k(bin) + energy
+                    counts(bin) = counts(bin) + 1
+                    k_vals(bin) = k_vals(bin) + k_mag
+                end if
+            end do
+        end do
+
+        ! Average wavenumber in each bin
+        do bin = 1, n_bins
+            if (counts(bin) > 0) then
+                k_vals(bin) = k_vals(bin) / real(counts(bin))
+            else
+                k_vals(bin) = (real(bin) - 0.5_sp) * dk
+            end if
+        end do
+
+        deallocate(spectrum_d, spectrum_h)
+    end subroutine
+
+    !=========================================================================
+    ! Spectral filter kernel (GPU)
+    ! Zeroes out modes above k_cutoff (low-pass) or below (high-pass)
+    !=========================================================================
+    attributes(global) subroutine filter_spectrum_kernel_2d( &
+            spectrum, nkx, ny, k_cutoff, filter_type)
+        complex(sp), intent(inout) :: spectrum(nkx, ny)
+        integer, value, intent(in) :: nkx, ny
+        real(sp), value, intent(in) :: k_cutoff
+        integer, value, intent(in) :: filter_type  ! 0=low-pass, 1=high-pass
+
+        integer :: i, j, idx
+        real(sp) :: kx, ky, k_mag
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        kx = real(i - 1)
+        if (j <= ny/2 + 1) then
+            ky = real(j - 1)
+        else
+            ky = real(j - 1 - ny)
+        end if
+
+        k_mag = sqrt(kx**2 + ky**2)
+
+        if (filter_type == 0) then
+            ! Low-pass: zero out high frequencies
+            if (k_mag > k_cutoff) spectrum(i, j) = cmplx(0.0, 0.0)
+        else
+            ! High-pass: zero out low frequencies
+            if (k_mag <= k_cutoff) spectrum(i, j) = cmplx(0.0, 0.0)
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Apply spectral filter to a 2D field
+    ! Returns filtered field on device
+    !
+    ! filter_type: 0 = low-pass (keep modes below k_cutoff)
+    !              1 = high-pass (keep modes above k_cutoff)
+    !=========================================================================
+    subroutine spectral_filter_2d(field_in_d, field_out_d, nx, ny, k_cutoff, filter_type)
+        integer, intent(in) :: nx, ny, filter_type
+        real(sp), intent(in) :: k_cutoff
+        real(sp), device, intent(in) :: field_in_d(nx, ny)
+        real(sp), device, intent(out) :: field_out_d(nx, ny)
+
+        complex(sp), device, allocatable :: spectrum_d(:,:)
+        integer :: nkx, n_total, n_blocks, ierr, i, j
+
+        nkx = nx/2 + 1
+        allocate(spectrum_d(nkx, ny))
+
+        ! Forward FFT
+        call fft2d_forward(field_in_d, spectrum_d, nx, ny)
+
+        ! Apply filter on GPU
+        n_total = nkx * ny
+        n_blocks = (n_total + 255) / 256
+        call filter_spectrum_kernel_2d<<<n_blocks, 256>>>(spectrum_d, nkx, ny, k_cutoff, filter_type)
+        ierr = cudaDeviceSynchronize()
+
+        ! Inverse FFT
+        call fft2d_inverse(spectrum_d, field_out_d, nx, ny)
+
+        ! Normalize (cuFFT inverse is unnormalized)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                field_out_d(i, j) = field_out_d(i, j) / real(nx * ny)
+            end do
+        end do
+
+        deallocate(spectrum_d)
+    end subroutine
+
+    !=========================================================================
+    ! Coarse-grain a field: low-pass filter then downsample
+    ! This creates training pairs: (coarse, fine) for super-resolution
+    !
+    ! coarse_nx, coarse_ny must divide nx, ny evenly
+    !=========================================================================
+    subroutine coarse_grain_2d(fine_d, coarse_h, nx, ny, coarse_nx, coarse_ny)
+        integer, intent(in) :: nx, ny, coarse_nx, coarse_ny
+        real(sp), device, intent(in) :: fine_d(nx, ny)
+        real(sp), intent(out) :: coarse_h(coarse_nx, coarse_ny)
+
+        real(sp), device, allocatable :: filtered_d(:,:)
+        real(sp), allocatable :: filtered_h(:,:)
+        real(sp) :: k_cutoff
+        integer :: i, j, stride_x, stride_y
+
+        allocate(filtered_d(nx, ny))
+        allocate(filtered_h(nx, ny))
+
+        ! Cutoff at the Nyquist of the coarse grid
+        k_cutoff = real(min(coarse_nx, coarse_ny)) / 2.0_sp
+
+        ! Low-pass filter
+        call spectral_filter_2d(fine_d, filtered_d, nx, ny, k_cutoff, 0)
+
+        ! Copy to host and downsample
+        filtered_h = filtered_d
+
+        stride_x = nx / coarse_nx
+        stride_y = ny / coarse_ny
+
+        do j = 1, coarse_ny
+            do i = 1, coarse_nx
+                coarse_h(i, j) = filtered_h((i-1)*stride_x + 1, (j-1)*stride_y + 1)
+            end do
+        end do
+
+        deallocate(filtered_d, filtered_h)
+    end subroutine
+
+    !=========================================================================
+    ! Write energy spectrum to file (for Python plotting)
+    !=========================================================================
+    subroutine write_spectrum(filename, E_k, k_vals, n_bins)
+        character(len=*), intent(in) :: filename
+        real(sp), intent(in) :: E_k(MAX_BINS), k_vals(MAX_BINS)
+        integer, intent(in) :: n_bins
+        integer :: i, unit_num
+
+        unit_num = 20
+        open(unit=unit_num, file=filename, status='replace')
+        write(unit_num, '(A)') '# k  E(k)'
+        do i = 1, n_bins
+            if (k_vals(i) > 0.0_sp .and. E_k(i) > 0.0_sp) then
+                write(unit_num, '(ES14.6, 1X, ES14.6)') k_vals(i), E_k(i)
+            end if
+        end do
+        close(unit_num)
+        print '(A,A)', '  Spectrum written to: ', trim(filename)
+    end subroutine
+
+    !=========================================================================
+    ! Write 2D field to binary file (for Python loading)
+    ! Format: nx(int32), ny(int32), data(float32 array)
+    !=========================================================================
+    subroutine write_field_2d(filename, field, nx, ny)
+        character(len=*), intent(in) :: filename
+        real(sp), intent(in) :: field(nx, ny)
+        integer, intent(in) :: nx, ny
+        integer :: unit_num
+
+        unit_num = 21
+        open(unit=unit_num, file=filename, form='unformatted', access='stream', status='replace')
+        write(unit_num) nx, ny
+        write(unit_num) field
+        close(unit_num)
+        print '(A,A,A,I0,A,I0)', '  Field written to: ', trim(filename), &
+              ' (', nx, 'x', ny, ')'
+    end subroutine
+
+    !=========================================================================
+    ! Read 2D field from binary file
+    !=========================================================================
+    subroutine read_field_2d(filename, field, nx, ny)
+        character(len=*), intent(in) :: filename
+        real(sp), intent(out) :: field(nx, ny)
+        integer, intent(in) :: nx, ny
+        integer :: unit_num, file_nx, file_ny
+
+        unit_num = 22
+        open(unit=unit_num, file=filename, form='unformatted', access='stream', status='old')
+        read(unit_num) file_nx, file_ny
+        if (file_nx /= nx .or. file_ny /= ny) then
+            print *, "ERROR: Field dimensions mismatch!"
+            print *, "  Expected:", nx, ny, " Got:", file_nx, file_ny
+            close(unit_num)
+            return
+        end if
+        read(unit_num) field
+        close(unit_num)
+    end subroutine
+
+end module spectral_tools

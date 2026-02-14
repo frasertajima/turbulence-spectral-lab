@@ -1,0 +1,18 @@
+# Build artifacts
+fortran/*.o
+fortran/*.mod
+fortran/experiment_*[!.cuf]
+
+# Data files (too large for git)
+experiments/*/fields/*.bin
+experiments/*/runs/
+data/synthetic/*.bin
+data/les/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Plots (regenerable)
+experiments/*/*.png
