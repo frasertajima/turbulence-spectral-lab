@@ -10,11 +10,15 @@
 
 module realtime_wrapper
     use iso_c_binding
+    use cudafor
+    use cufft
     use spectral_tools, only: sp, TWO_PI
     use synthetic_turbulence
     use burgers_solver
-    use stam_solver, only: stam_state, stam_init, stam_set_ic, stam_step, &
-                           stam_run, stam_get_u, stam_get_v, stam_cleanup
+    use stam_solver, only: stam_state, stam_init, stam_enable_ns, stam_set_ic, &
+                           stam_step, stam_run, stam_get_u, stam_get_v, stam_cleanup, &
+                           stam_enable_density, stam_get_rho, stam_set_rho, &
+                           stam_set_walls
     implicit none
 
     ! Module-level solver states
@@ -123,7 +127,168 @@ contains
     end subroutine
 
     !=========================================================================
-    ! Set Stam u field from host array (for applying CNN correction)
+    ! Enable/disable N-S mode on both solvers
+    ! use_ns=1 -> incompressible N-S, use_ns=0 -> Burgers
+    !=========================================================================
+    subroutine rt_set_ns_mode(use_ns) bind(c, name='rt_set_ns_mode')
+        integer(c_int), value :: use_ns
+
+        if (use_ns /= 0) then
+            spectral_solver%use_ns = .true.
+            call stam_enable_ns(stam_solver_state)
+        else
+            spectral_solver%use_ns = .false.
+            stam_solver_state%use_ns = .false.
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Set identical divergence-free IC in both solvers from a seed
+    ! Uses stream function: u = dpsi/dy, v = -dpsi/dx
+    !=========================================================================
+    subroutine rt_set_ic_from_seed_ns(seed) bind(c, name='rt_set_ic_from_seed_ns')
+        integer(c_int), value :: seed
+
+        real(sp), allocatable :: u_h(:,:), v_h(:,:)
+        real(sp), device, allocatable :: psi_d(:,:), filt_d(:,:), deriv_d(:,:)
+        complex(sp), device, allocatable :: psi_hat(:,:), deriv_hat(:,:)
+        real(sp), device, allocatable :: kx_d(:), ky_d(:)
+        real(sp), allocatable :: kx_h(:), ky_h(:)
+        integer :: nkx, n_total, n_blocks, ierr, i, j, plan_r2c, plan_c2r
+        real(sp) :: k_ic, scale_factor, u_max_val, norm
+
+        nkx = g_nx / 2 + 1
+        n_total = nkx * g_ny
+        n_blocks = (n_total + 255) / 256
+        norm = 1.0_sp / real(g_nx * g_ny)
+        k_ic = 16.0_sp
+
+        allocate(u_h(g_nx, g_ny), v_h(g_nx, g_ny))
+        allocate(psi_d(g_nx, g_ny), filt_d(g_nx, g_ny), deriv_d(g_nx, g_ny))
+        allocate(psi_hat(nkx, g_ny), deriv_hat(nkx, g_ny))
+        allocate(kx_d(nkx), ky_d(g_ny))
+        allocate(kx_h(nkx), ky_h(g_ny))
+
+        ! Build wavenumber arrays
+        do i = 1, nkx
+            kx_h(i) = TWO_PI * real(i - 1) / TWO_PI
+        end do
+        do i = 1, g_ny
+            if (i <= g_ny/2 + 1) then
+                ky_h(i) = TWO_PI * real(i - 1) / TWO_PI
+            else
+                ky_h(i) = TWO_PI * real(i - 1 - g_ny) / TWO_PI
+            end if
+        end do
+        kx_d = kx_h
+        ky_d = ky_h
+
+        ierr = cufftPlan2d(plan_r2c, g_ny, g_nx, CUFFT_R2C)
+        ierr = cufftPlan2d(plan_c2r, g_ny, g_nx, CUFFT_C2R)
+
+        ! Generate random stream function
+        call generate_kolmogorov_2d(psi_d, g_nx, g_ny, seed)
+        call normalize_field_2d(psi_d, g_nx, g_ny)
+        call spectral_filter_2d(psi_d, filt_d, g_nx, g_ny, k_ic, 0)
+
+        ! FFT stream function
+        ierr = cufftExecR2C(plan_r2c, filt_d, psi_hat)
+
+        ! u = d(psi)/dy
+        call rt_spectral_deriv_y<<<n_blocks, 256>>>(psi_hat, deriv_hat, ky_d, nkx, g_ny)
+        ierr = cufftExecC2R(plan_c2r, deriv_hat, deriv_d)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, g_ny
+            do i = 1, g_nx
+                deriv_d(i,j) = deriv_d(i,j) * norm
+            end do
+        end do
+        u_h = deriv_d
+
+        ! v = -d(psi)/dx
+        call rt_spectral_deriv_x<<<n_blocks, 256>>>(psi_hat, deriv_hat, kx_d, nkx, g_ny)
+        ierr = cufftExecC2R(plan_c2r, deriv_hat, deriv_d)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, g_ny
+            do i = 1, g_nx
+                deriv_d(i,j) = -deriv_d(i,j) * norm
+            end do
+        end do
+        v_h = deriv_d
+
+        ! Scale to max|u|=1
+        u_max_val = max(maxval(abs(u_h)), maxval(abs(v_h)))
+        if (u_max_val > 0.0_sp) then
+            scale_factor = 1.0_sp / u_max_val
+            u_h = u_h * scale_factor
+            v_h = v_h * scale_factor
+        end if
+
+        call burgers_set_ic(spectral_solver, u_h, v_h)
+        call stam_set_ic(stam_solver_state, u_h, v_h)
+
+        ierr = cufftDestroy(plan_r2c)
+        ierr = cufftDestroy(plan_c2r)
+        deallocate(u_h, v_h, psi_d, filt_d, deriv_d, psi_hat, deriv_hat)
+        deallocate(kx_d, ky_d, kx_h, ky_h)
+    end subroutine
+
+    !=========================================================================
+    ! Spectral derivative helper kernels for divergence-free IC
+    !=========================================================================
+    attributes(global) subroutine rt_spectral_deriv_x(u_hat, du_hat, kx, nkx, ny_l)
+        complex(sp), intent(in) :: u_hat(nkx, ny_l)
+        complex(sp), intent(out) :: du_hat(nkx, ny_l)
+        real(sp), intent(in) :: kx(nkx)
+        integer, value, intent(in) :: nkx, ny_l
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny_l) return
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * kx(i), real(u_hat(i,j)) * kx(i))
+    end subroutine
+
+    attributes(global) subroutine rt_spectral_deriv_y(u_hat, du_hat, ky, nkx, ny_l)
+        complex(sp), intent(in) :: u_hat(nkx, ny_l)
+        complex(sp), intent(out) :: du_hat(nkx, ny_l)
+        real(sp), intent(in) :: ky(ny_l)
+        integer, value, intent(in) :: nkx, ny_l
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny_l) return
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * ky(j), real(u_hat(i,j)) * ky(j))
+    end subroutine
+
+    !=========================================================================
+    ! Get v fields (copy from device to host)
+    !=========================================================================
+    subroutine rt_get_stam_v(v_out) bind(c, name='rt_get_stam_v')
+        real(c_float), intent(out) :: v_out(g_nx, g_ny)
+        real(sp), allocatable :: v_h(:,:)
+
+        allocate(v_h(g_nx, g_ny))
+        call stam_get_v(stam_solver_state, v_h)
+        v_out = v_h
+        deallocate(v_h)
+    end subroutine
+
+    subroutine rt_get_spectral_v(v_out) bind(c, name='rt_get_spectral_v')
+        real(c_float), intent(out) :: v_out(g_nx, g_ny)
+        real(sp), allocatable :: v_h(:,:)
+
+        allocate(v_h(g_nx, g_ny))
+        call burgers_get_v(spectral_solver, v_h)
+        v_out = v_h
+        deallocate(v_h)
+    end subroutine
+
+    !=========================================================================
+    ! Set Stam fields from host arrays (for applying CNN correction)
     !=========================================================================
     subroutine rt_set_stam_u(u_in) bind(c, name='rt_set_stam_u')
         real(c_float), intent(in) :: u_in(g_nx, g_ny)
@@ -133,6 +298,166 @@ contains
         u_h = u_in
         stam_solver_state%u = u_h
         deallocate(u_h)
+    end subroutine
+
+    subroutine rt_set_stam_v(v_in) bind(c, name='rt_set_stam_v')
+        real(c_float), intent(in) :: v_in(g_nx, g_ny)
+        real(sp), allocatable :: v_h(:,:)
+
+        allocate(v_h(g_nx, g_ny))
+        v_h = v_in
+        stam_solver_state%v = v_h
+        deallocate(v_h)
+    end subroutine
+
+    !=========================================================================
+    ! Enable/disable absorbing boundaries on Stam solver
+    ! use_walls=1 -> absorbing (fluid leaving domain is lost)
+    ! use_walls=0 -> periodic (default)
+    !=========================================================================
+    subroutine rt_set_walls(use_walls) bind(c, name='rt_set_walls')
+        integer(c_int), value :: use_walls
+
+        call stam_set_walls(stam_solver_state, use_walls /= 0)
+    end subroutine
+
+    !=========================================================================
+    ! Enable density tracer on Stam solver
+    !=========================================================================
+    subroutine rt_enable_density(diffusion, decay) bind(c, name='rt_enable_density')
+        real(c_float), value :: diffusion, decay
+
+        call stam_enable_density(stam_solver_state, real(diffusion, sp), real(decay, sp))
+    end subroutine
+
+    !=========================================================================
+    ! Set zero IC (empty field — no flow until user drags)
+    !=========================================================================
+    subroutine rt_set_zero_ic() bind(c, name='rt_set_zero_ic')
+        stam_solver_state%u = 0.0_sp
+        stam_solver_state%v = 0.0_sp
+        stam_solver_state%u_prev = 0.0_sp
+        stam_solver_state%v_prev = 0.0_sp
+        if (stam_solver_state%has_density) then
+            stam_solver_state%rho = 0.0_sp
+            stam_solver_state%rho_prev = 0.0_sp
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Get density field (copy from device to host)
+    !=========================================================================
+    subroutine rt_get_stam_rho(rho_out) bind(c, name='rt_get_stam_rho')
+        real(c_float), intent(out) :: rho_out(g_nx, g_ny)
+        real(sp), allocatable :: rho_h(:,:)
+
+        allocate(rho_h(g_nx, g_ny))
+        call stam_get_rho(stam_solver_state, rho_h)
+        rho_out = rho_h
+        deallocate(rho_h)
+    end subroutine
+
+    !=========================================================================
+    ! Add Gaussian density blob at normalized position (cx,cy) in [0,1]
+    !=========================================================================
+    subroutine rt_add_density(cx, cy, amount, radius) bind(c, name='rt_add_density')
+        real(c_float), value :: cx, cy, amount, radius
+
+        real(sp), allocatable :: rho_h(:,:)
+        real(sp) :: gx, gy, r2, sigma2, weight
+        integer :: i, j, ci, cj
+
+        if (.not. stam_solver_state%has_density) return
+
+        allocate(rho_h(g_nx, g_ny))
+        sigma2 = real(radius, sp) * real(radius, sp)
+        ci = nint(cx * real(g_nx, sp))
+        cj = nint(cy * real(g_ny, sp))
+
+        call stam_get_rho(stam_solver_state, rho_h)
+        do j = 1, g_ny
+            do i = 1, g_nx
+                gx = real(i - ci, sp)
+                gy = real(j - cj, sp)
+                r2 = gx*gx + gy*gy
+                weight = exp(-r2 / (2.0_sp * sigma2))
+                rho_h(i, j) = rho_h(i, j) + real(amount, sp) * weight
+            end do
+        end do
+        call stam_set_rho(stam_solver_state, rho_h)
+        deallocate(rho_h)
+    end subroutine
+
+    !=========================================================================
+    ! Add Gaussian force impulse at normalized position (cx,cy) in [0,1]
+    ! Applied to BOTH solvers to keep them in sync
+    ! Also injects dye proportional to force magnitude
+    !=========================================================================
+    subroutine rt_add_force(fx, fy, cx, cy, radius) bind(c, name='rt_add_force')
+        real(c_float), value :: fx, fy, cx, cy, radius
+
+        real(sp), allocatable :: u_h(:,:), v_h(:,:), rho_h(:,:)
+        real(sp) :: gx, gy, r2, sigma2, weight, dye_amount
+        integer :: i, j, ci, cj
+
+        allocate(u_h(g_nx, g_ny), v_h(g_nx, g_ny))
+        sigma2 = real(radius, sp) * real(radius, sp)
+        ci = nint(cx * real(g_nx, sp))
+        cj = nint(cy * real(g_ny, sp))
+
+        ! Apply to Stam solver
+        call stam_get_u(stam_solver_state, u_h)
+        call stam_get_v(stam_solver_state, v_h)
+        do j = 1, g_ny
+            do i = 1, g_nx
+                gx = real(i - ci, sp)
+                gy = real(j - cj, sp)
+                r2 = gx*gx + gy*gy
+                weight = exp(-r2 / (2.0_sp * sigma2))
+                u_h(i, j) = u_h(i, j) + real(fx, sp) * weight
+                v_h(i, j) = v_h(i, j) + real(fy, sp) * weight
+            end do
+        end do
+        stam_solver_state%u = u_h
+        stam_solver_state%v = v_h
+
+        ! Also inject dye at force location (proportional to force magnitude)
+        if (stam_solver_state%has_density) then
+            dye_amount = min(sqrt(real(fx, sp)**2 + real(fy, sp)**2) * 0.1_sp, 1.0_sp)
+            if (dye_amount > 0.001_sp) then
+                allocate(rho_h(g_nx, g_ny))
+                call stam_get_rho(stam_solver_state, rho_h)
+                do j = 1, g_ny
+                    do i = 1, g_nx
+                        gx = real(i - ci, sp)
+                        gy = real(j - cj, sp)
+                        r2 = gx*gx + gy*gy
+                        weight = exp(-r2 / (2.0_sp * sigma2))
+                        rho_h(i, j) = min(rho_h(i, j) + dye_amount * weight, 5.0_sp)
+                    end do
+                end do
+                call stam_set_rho(stam_solver_state, rho_h)
+                deallocate(rho_h)
+            end if
+        end if
+
+        ! Apply same force to spectral solver
+        call burgers_get_u(spectral_solver, u_h)
+        call burgers_get_v(spectral_solver, v_h)
+        do j = 1, g_ny
+            do i = 1, g_nx
+                gx = real(i - ci, sp)
+                gy = real(j - cj, sp)
+                r2 = gx*gx + gy*gy
+                weight = exp(-r2 / (2.0_sp * sigma2))
+                u_h(i, j) = u_h(i, j) + real(fx, sp) * weight
+                v_h(i, j) = v_h(i, j) + real(fy, sp) * weight
+            end do
+        end do
+        spectral_solver%u = u_h
+        spectral_solver%v = v_h
+
+        deallocate(u_h, v_h)
     end subroutine
 
     !=========================================================================

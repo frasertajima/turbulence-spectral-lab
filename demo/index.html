@@ -1,0 +1,923 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Turbulence Spectral Lab - Real-Time Demo</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: #1a1a2e;
+                color: #e0e0e0;
+                font-family: "Segoe UI", system-ui, sans-serif;
+                overflow: hidden;
+                height: 100vh;
+            }
+
+            /* --- Controls bar --- */
+            #controls {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+                padding: 8px 16px;
+                background: #16213e;
+                border-bottom: 1px solid #334;
+                flex-wrap: wrap;
+            }
+            #controls label {
+                font-size: 13px;
+                color: #aab;
+            }
+            #controls select,
+            #controls button {
+                background: #0f3460;
+                color: #e0e0e0;
+                border: 1px solid #446;
+                padding: 4px 10px;
+                border-radius: 4px;
+                font-size: 13px;
+                cursor: pointer;
+            }
+            #controls button:hover {
+                background: #1a5276;
+            }
+            #controls button.active {
+                background: #e94560;
+                border-color: #e94560;
+            }
+            #controls input[type="range"] {
+                width: 80px;
+                vertical-align: middle;
+            }
+            .sep {
+                width: 1px;
+                height: 24px;
+                background: #334;
+            }
+
+            /* --- Main layout --- */
+            #main {
+                display: flex;
+                height: calc(100vh - 80px);
+                padding: 8px;
+                gap: 8px;
+            }
+
+            /* --- Field panels --- */
+            .panel {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                background: #16213e;
+                border-radius: 6px;
+                padding: 6px;
+                min-width: 0;
+            }
+            .panel-title {
+                font-size: 13px;
+                font-weight: 600;
+                margin-bottom: 4px;
+                color: #aab;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+            .field-canvas {
+                image-rendering: pixelated;
+                cursor: crosshair;
+                border-radius: 3px;
+            }
+
+            /* --- Spectrum panel --- */
+            #spectrum-panel {
+                flex: 1;
+                min-width: 280px;
+            }
+            #spectrum-canvas {
+                width: 100%;
+                height: 100%;
+                border-radius: 3px;
+            }
+
+            /* --- Status bar --- */
+            #status {
+                display: flex;
+                align-items: center;
+                gap: 20px;
+                padding: 6px 16px;
+                background: #16213e;
+                border-top: 1px solid #334;
+                font-size: 13px;
+                font-family: "JetBrains Mono", monospace;
+                color: #7f8c8d;
+            }
+            #status .val {
+                color: #e0e0e0;
+                font-weight: 600;
+            }
+            #status .good {
+                color: #2ecc71;
+            }
+            #status .warn {
+                color: #e67e22;
+            }
+
+            /* --- Colorbar --- */
+            #colorbar-container {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 0 4px;
+            }
+            #colorbar {
+                width: 16px;
+                border-radius: 3px;
+            }
+            .cb-label {
+                font-size: 10px;
+                color: #889;
+                font-family: monospace;
+            }
+        </style>
+    </head>
+    <body>
+        <!-- Controls -->
+        <div id="controls">
+            <button id="btn-clear" title="Clear all fields">Clear</button>
+            <button
+                id="btn-random-ic"
+                title="Generate random turbulent initial condition"
+            >
+                Random IC
+            </button>
+            <button id="btn-pause" title="Pause/resume simulation">
+                Pause
+            </button>
+            <div class="sep"></div>
+            <label
+                >Physics:
+                <select id="sel-mode">
+                    <option value="ns" selected>Navier-Stokes</option>
+                    <option value="burgers">Burgers</option>
+                </select>
+            </label>
+            <label
+                >Model:
+                <select id="sel-model">
+                    <option value="fno" selected>FNO</option>
+                    <option value="cnn">CNN</option>
+                    <option value="none">No Correction</option>
+                </select>
+            </label>
+            <div class="sep"></div>
+            <label
+                >Display:
+                <select id="sel-display">
+                    <option value="density" selected>Density (dye)</option>
+                    <option value="vorticity">Vorticity</option>
+                    <option value="u">u velocity</option>
+                    <option value="v">v velocity</option>
+                    <option value="speed">Speed |v|</option>
+                </select>
+            </label>
+            <div class="sep"></div>
+            <label
+                >Steps/frame:
+                <input
+                    type="range"
+                    id="slider-steps"
+                    min="1"
+                    max="20"
+                    value="5"
+                />
+                <span id="steps-val">5</span>
+            </label>
+            <div class="sep"></div>
+            <label
+                >Correction &alpha;:
+                <input
+                    type="range"
+                    id="slider-alpha"
+                    min="0"
+                    max="100"
+                    value="100"
+                />
+                <span id="alpha-val">1.00</span>
+            </label>
+            <div class="sep"></div>
+            <button id="btn-walls" title="Toggle absorbing boundaries">
+                Walls: Off
+            </button>
+            <div class="sep"></div>
+            <button
+                id="btn-spectral"
+                title="Toggle spectral reference (expensive)"
+            >
+                Spectral Ref
+            </button>
+        </div>
+
+        <!-- Main panels -->
+        <div id="main">
+            <div class="panel" id="panel-stam">
+                <div class="panel-title">Raw Stam Solver</div>
+                <canvas
+                    class="field-canvas"
+                    id="canvas-stam"
+                    width="128"
+                    height="128"
+                ></canvas>
+            </div>
+            <div class="panel" id="panel-corrected">
+                <div class="panel-title">FNO-Corrected</div>
+                <canvas
+                    class="field-canvas"
+                    id="canvas-corrected"
+                    width="128"
+                    height="128"
+                ></canvas>
+            </div>
+            <div class="panel" id="panel-spectral" style="display: none">
+                <div class="panel-title">Spectral Reference</div>
+                <canvas
+                    class="field-canvas"
+                    id="canvas-spectral"
+                    width="128"
+                    height="128"
+                ></canvas>
+            </div>
+            <div id="colorbar-container">
+                <span class="cb-label" id="cb-max">+1.0</span>
+                <canvas id="colorbar" width="16" height="200"></canvas>
+                <span class="cb-label" id="cb-min">-1.0</span>
+            </div>
+            <div class="panel" id="spectrum-panel">
+                <div class="panel-title">Energy Spectrum E(k)</div>
+                <canvas id="spectrum-canvas"></canvas>
+            </div>
+        </div>
+
+        <!-- Status bar -->
+        <div id="status">
+            <span>FPS: <span class="val" id="st-fps">--</span></span>
+            <span>Sim: <span class="val" id="st-sim">--</span> ms</span>
+            <span>Correction: <span class="val" id="st-corr">--</span> ms</span>
+            <span>Step: <span class="val" id="st-step">0</span></span>
+            <span>Model: <span class="val" id="st-model">FNO</span></span>
+        </div>
+
+        <script>
+            const NX = 128,
+                NY = 128;
+            const FIELD_BYTES = NX * NY * 4;
+            const SPEC_LEN = NX / 2; // 64 bins
+
+            // --- DOM refs ---
+            const canvasStam = document.getElementById("canvas-stam");
+            const canvasCorrected = document.getElementById("canvas-corrected");
+            const canvasSpectral = document.getElementById("canvas-spectral");
+            const canvasSpectrum = document.getElementById("spectrum-canvas");
+            const canvasColorbar = document.getElementById("colorbar");
+
+            const ctxStam = canvasStam.getContext("2d");
+            const ctxCorrected = canvasCorrected.getContext("2d");
+            const ctxSpectral = canvasSpectral.getContext("2d");
+            const ctxSpectrum = canvasSpectrum.getContext("2d");
+            const ctxColorbar = canvasColorbar.getContext("2d");
+
+            // --- State ---
+            let ws = null;
+            let showSpectral = false;
+            let displayMode = "density";
+            let isPaused = false;
+
+            // Current frame data (u, v for each solver)
+            let currentFrame = null;
+
+            // --- Colormap (blue-white-red diverging) ---
+            function colormap(t) {
+                // t in [0, 1]: 0=blue, 0.5=white, 1=red
+                t = Math.max(0, Math.min(1, t));
+                let r, g, b;
+                if (t < 0.5) {
+                    const s = t * 2; // 0..1
+                    r = Math.round(59 + s * 196);
+                    g = Math.round(76 + s * 179);
+                    b = Math.round(192 + s * 63);
+                } else {
+                    const s = (t - 0.5) * 2; // 0..1
+                    r = Math.round(255 - s * 26);
+                    g = Math.round(255 - s * 186);
+                    b = Math.round(255 - s * 186);
+                }
+                return [r, g, b];
+            }
+
+            // --- Density colormap (black -> cyan -> white) ---
+            function colormapDensity(t) {
+                t = Math.max(0, Math.min(1, t));
+                if (t < 0.5) {
+                    const s = t * 2;
+                    return [0, Math.round(s * 200), Math.round(s * 220)];
+                } else {
+                    const s = (t - 0.5) * 2;
+                    return [
+                        Math.round(s * 255),
+                        Math.round(200 + s * 55),
+                        Math.round(220 + s * 35),
+                    ];
+                }
+            }
+
+            // Draw the colorbar once
+            function drawColorbar() {
+                const w = canvasColorbar.width,
+                    h = canvasColorbar.height;
+                const img = ctxColorbar.createImageData(w, h);
+                for (let y = 0; y < h; y++) {
+                    const t = 1.0 - y / (h - 1); // top=1 (red), bottom=0 (blue)
+                    const [r, g, b] = colormap(t);
+                    for (let x = 0; x < w; x++) {
+                        const idx = (y * w + x) * 4;
+                        img.data[idx] = r;
+                        img.data[idx + 1] = g;
+                        img.data[idx + 2] = b;
+                        img.data[idx + 3] = 255;
+                    }
+                }
+                ctxColorbar.putImageData(img, 0, 0);
+            }
+            drawColorbar();
+
+            // --- Compute derived fields client-side ---
+            // Buffer: field[j * NX + i], rendered with j=row (y), i=col (x)
+            // Vorticity: omega = dv/dx - du/dy
+            function computeVorticity(u, v) {
+                const omega = new Float32Array(NX * NY);
+                for (let j = 0; j < NY; j++) {
+                    for (let i = 0; i < NX; i++) {
+                        const ip = (i + 1) % NX,
+                            im = (i - 1 + NX) % NX;
+                        const jp = (j + 1) % NY,
+                            jm = (j - 1 + NY) % NY;
+                        // dv/dx: v changes along i (x = col direction)
+                        const dvdx = (v[j * NX + ip] - v[j * NX + im]) * 0.5;
+                        // du/dy: u changes along j (y = row direction)
+                        const dudy = (u[jp * NX + i] - u[jm * NX + i]) * 0.5;
+                        omega[j * NX + i] = dvdx - dudy;
+                    }
+                }
+                return omega;
+            }
+
+            function computeSpeed(u, v) {
+                const spd = new Float32Array(NX * NY);
+                for (let k = 0; k < NX * NY; k++) {
+                    spd[k] = Math.sqrt(u[k] * u[k] + v[k] * v[k]);
+                }
+                return spd;
+            }
+
+            function getDisplayField(u, v, rho) {
+                switch (displayMode) {
+                    case "density":
+                        return rho;
+                    case "u":
+                        return u;
+                    case "v":
+                        return v;
+                    case "speed":
+                        return computeSpeed(u, v);
+                    case "vorticity":
+                        return computeVorticity(u, v);
+                    default:
+                        return rho || u;
+                }
+            }
+
+            // --- Render a field to canvas ---
+            function renderField(ctx, field, vmin, vmax, cmap) {
+                cmap = cmap || colormap;
+                const img = ctx.createImageData(NX, NY);
+                const range = vmax - vmin || 1;
+                for (let j = 0; j < NY; j++) {
+                    for (let i = 0; i < NX; i++) {
+                        const val = field[j * NX + i];
+                        const t = (val - vmin) / range;
+                        const [r, g, b] = cmap(t);
+                        // Flip y: canvas row 0 = top, but field row 0 = bottom
+                        const py = (NY - 1 - j) * NX + i;
+                        const idx = py * 4;
+                        img.data[idx] = r;
+                        img.data[idx + 1] = g;
+                        img.data[idx + 2] = b;
+                        img.data[idx + 3] = 255;
+                    }
+                }
+                ctx.putImageData(img, 0, 0);
+            }
+
+            // --- Symmetric auto-range for diverging fields ---
+            function symRange(field) {
+                let mx = 0;
+                for (let k = 0; k < field.length; k++) {
+                    const a = Math.abs(field[k]);
+                    if (a > mx) mx = a;
+                }
+                mx = mx || 1;
+                return [-mx, mx];
+            }
+
+            // For speed (always positive)
+            function posRange(field) {
+                let mx = 0;
+                for (let k = 0; k < field.length; k++) {
+                    if (field[k] > mx) mx = field[k];
+                }
+                return [0, mx || 1];
+            }
+
+            // --- Spectrum chart ---
+            function drawSpectrum(kVals, eStam, eCorr, eSpec) {
+                const canvas = canvasSpectrum;
+                const ctx = ctxSpectrum;
+                const W = canvas.width,
+                    H = canvas.height;
+                ctx.clearRect(0, 0, W, H);
+
+                const margin = { top: 10, right: 15, bottom: 35, left: 55 };
+                const w = W - margin.left - margin.right;
+                const h = H - margin.top - margin.bottom;
+
+                // Find range (skip k=0)
+                let eMin = Infinity,
+                    eMax = -Infinity;
+                for (let i = 1; i < SPEC_LEN; i++) {
+                    for (const e of [eStam[i], eCorr[i]]) {
+                        if (e > 1e-20) {
+                            eMin = Math.min(eMin, e);
+                            eMax = Math.max(eMax, e);
+                        }
+                    }
+                    if (eSpec && eSpec[i] > 1e-20) {
+                        eMin = Math.min(eMin, eSpec[i]);
+                        eMax = Math.max(eMax, eSpec[i]);
+                    }
+                }
+                if (eMin >= eMax) {
+                    eMin = 1e-10;
+                    eMax = 1;
+                }
+                eMin *= 0.3;
+                eMax *= 3;
+                const kMin = 1,
+                    kMax = SPEC_LEN - 1;
+
+                const toX = (k) =>
+                    margin.left +
+                    (w * Math.log10(k / kMin)) / Math.log10(kMax / kMin);
+                const toY = (e) => {
+                    if (e <= 0) return margin.top + h;
+                    return (
+                        margin.top +
+                        h * (1 - Math.log10(e / eMin) / Math.log10(eMax / eMin))
+                    );
+                };
+
+                // Grid lines
+                ctx.strokeStyle = "#2a2a4a";
+                ctx.lineWidth = 0.5;
+                for (
+                    let p = Math.ceil(Math.log10(eMin));
+                    p <= Math.floor(Math.log10(eMax));
+                    p++
+                ) {
+                    const y = toY(Math.pow(10, p));
+                    ctx.beginPath();
+                    ctx.moveTo(margin.left, y);
+                    ctx.lineTo(margin.left + w, y);
+                    ctx.stroke();
+                }
+                for (let k = 1; k <= kMax; k *= 10) {
+                    const x = toX(k);
+                    ctx.beginPath();
+                    ctx.moveTo(x, margin.top);
+                    ctx.lineTo(x, margin.top + h);
+                    ctx.stroke();
+                }
+
+                // Draw a spectrum line
+                function drawLine(data, color, lineWidth) {
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = lineWidth;
+                    ctx.beginPath();
+                    let started = false;
+                    for (let i = 1; i < SPEC_LEN; i++) {
+                        if (data[i] > 1e-20) {
+                            const x = toX(i),
+                                y = toY(data[i]);
+                            if (!started) {
+                                ctx.moveTo(x, y);
+                                started = true;
+                            } else ctx.lineTo(x, y);
+                        }
+                    }
+                    ctx.stroke();
+                }
+
+                // -5/3 reference line
+                ctx.setLineDash([4, 4]);
+                ctx.strokeStyle = "#555";
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                const e0 = eMax * 0.3;
+                ctx.moveTo(toX(1), toY(e0));
+                ctx.lineTo(toX(kMax), toY(e0 * Math.pow(kMax, -5 / 3)));
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Spectrum lines
+                drawLine(eStam, "#ff5555", 2);
+                drawLine(eCorr, "#55ff55", 2);
+                if (eSpec && showSpectral) drawLine(eSpec, "#5588ff", 2);
+
+                // Legend
+                const lx = margin.left + 10,
+                    ly = margin.top + 15;
+                ctx.font = "11px monospace";
+                ctx.fillStyle = "#ff5555";
+                ctx.fillText("Stam", lx + 15, ly);
+                ctx.fillStyle = "#55ff55";
+                ctx.fillText("Corrected", lx + 15, ly + 14);
+                if (showSpectral) {
+                    ctx.fillStyle = "#5588ff";
+                    ctx.fillText("Spectral", lx + 15, ly + 28);
+                }
+                ctx.fillStyle = "#555";
+                ctx.fillText("k^-5/3", lx + 15, ly + (showSpectral ? 42 : 28));
+
+                // Color dots for legend
+                [
+                    [ly - 4, "#ff5555"],
+                    [ly + 10, "#55ff55"],
+                    ...(showSpectral ? [[ly + 24, "#5588ff"]] : []),
+                ].forEach(([y, c]) => {
+                    ctx.fillStyle = c;
+                    ctx.fillRect(lx, y, 10, 3);
+                });
+
+                // Axes labels
+                ctx.fillStyle = "#889";
+                ctx.font = "11px sans-serif";
+                ctx.textAlign = "center";
+                ctx.fillText("Wavenumber k", margin.left + w / 2, H - 5);
+                ctx.save();
+                ctx.translate(12, margin.top + h / 2);
+                ctx.rotate(-Math.PI / 2);
+                ctx.fillText("E(k)", 0, 0);
+                ctx.restore();
+
+                // Tick labels
+                ctx.textAlign = "center";
+                ctx.font = "10px monospace";
+                ctx.fillStyle = "#667";
+                for (let k = 1; k <= kMax; k *= 10) {
+                    ctx.fillText(k, toX(k), margin.top + h + 14);
+                }
+                ctx.textAlign = "right";
+                for (
+                    let p = Math.ceil(Math.log10(eMin));
+                    p <= Math.floor(Math.log10(eMax));
+                    p += 2
+                ) {
+                    ctx.fillText(
+                        "1e" + p,
+                        margin.left - 4,
+                        toY(Math.pow(10, p)) + 4,
+                    );
+                }
+            }
+
+            // --- Parse binary frame ---
+            function parseFrame(buffer) {
+                const view = new DataView(buffer);
+                let off = 0;
+
+                const frameNumber = view.getInt32(off, true);
+                off += 4;
+                const totalSteps = view.getInt32(off, true);
+                off += 4;
+                const simMs = view.getFloat32(off, true);
+                off += 4;
+                const correctionMs = view.getFloat32(off, true);
+                off += 4;
+                const fps = view.getFloat32(off, true);
+                off += 4;
+                const flags = view.getInt32(off, true);
+                off += 4;
+
+                const hasSpectral = flags & 1;
+                const hasDensity = flags & 2;
+
+                const stamU = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const stamV = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const correctedU = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const correctedV = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+
+                let stamRho = null;
+                if (hasDensity) {
+                    stamRho = new Float32Array(buffer, off, NX * NY);
+                    off += FIELD_BYTES;
+                }
+
+                let spectralU = null,
+                    spectralV = null;
+                if (hasSpectral) {
+                    spectralU = new Float32Array(buffer, off, NX * NY);
+                    off += FIELD_BYTES;
+                    spectralV = new Float32Array(buffer, off, NX * NY);
+                    off += FIELD_BYTES;
+                }
+
+                const kVals = new Float32Array(buffer, off, SPEC_LEN);
+                off += SPEC_LEN * 4;
+                const eStam = new Float32Array(buffer, off, SPEC_LEN);
+                off += SPEC_LEN * 4;
+                const eCorr = new Float32Array(buffer, off, SPEC_LEN);
+                off += SPEC_LEN * 4;
+                let eSpec = null;
+                if (hasSpectral) {
+                    eSpec = new Float32Array(buffer, off, SPEC_LEN);
+                    off += SPEC_LEN * 4;
+                }
+
+                return {
+                    frameNumber,
+                    totalSteps,
+                    simMs,
+                    correctionMs,
+                    fps,
+                    hasSpectral,
+                    hasDensity,
+                    stamU,
+                    stamV,
+                    stamRho,
+                    correctedU,
+                    correctedV,
+                    spectralU,
+                    spectralV,
+                    kVals,
+                    eStam,
+                    eCorr,
+                    eSpec,
+                };
+            }
+
+            // --- Render a frame ---
+            function renderFrame(frame) {
+                currentFrame = frame;
+
+                const stamField = getDisplayField(
+                    frame.stamU,
+                    frame.stamV,
+                    frame.stamRho,
+                );
+                // For corrected panel: density is same (no correction on density)
+                const corrField = getDisplayField(
+                    frame.correctedU,
+                    frame.correctedV,
+                    frame.stamRho,
+                );
+
+                // Compute range and select colormap
+                const isDensity = displayMode === "density";
+                const isPositive = displayMode === "speed" || isDensity;
+                const cmap = isDensity ? colormapDensity : colormap;
+                const [vmin, vmax] = isPositive
+                    ? posRange(corrField)
+                    : symRange(corrField);
+
+                renderField(ctxStam, stamField, vmin, vmax, cmap);
+                renderField(ctxCorrected, corrField, vmin, vmax, cmap);
+
+                if (frame.hasSpectral && frame.spectralU) {
+                    const specField = getDisplayField(
+                        frame.spectralU,
+                        frame.spectralV,
+                        frame.stamRho,
+                    );
+                    renderField(ctxSpectral, specField, vmin, vmax, cmap);
+                }
+
+                // Update colorbar labels
+                document.getElementById("cb-max").textContent = vmax.toFixed(2);
+                document.getElementById("cb-min").textContent = vmin.toFixed(2);
+
+                // Spectrum
+                drawSpectrum(
+                    frame.kVals,
+                    frame.eStam,
+                    frame.eCorr,
+                    frame.eSpec,
+                );
+
+                // Status bar
+                const fpsEl = document.getElementById("st-fps");
+                fpsEl.textContent = frame.fps.toFixed(0);
+                fpsEl.className =
+                    "val " +
+                    (frame.fps >= 50 ? "good" : frame.fps >= 30 ? "warn" : "");
+                document.getElementById("st-sim").textContent =
+                    frame.simMs.toFixed(1);
+                document.getElementById("st-corr").textContent =
+                    frame.correctionMs.toFixed(1);
+                document.getElementById("st-step").textContent =
+                    frame.totalSteps;
+            }
+
+            // --- WebSocket ---
+            function connect() {
+                const proto = location.protocol === "https:" ? "wss:" : "ws:";
+                ws = new WebSocket(`${proto}//${location.host}/ws`);
+                ws.binaryType = "arraybuffer";
+
+                ws.onmessage = (evt) => {
+                    if (evt.data instanceof ArrayBuffer) {
+                        const frame = parseFrame(evt.data);
+                        renderFrame(frame);
+                    }
+                };
+
+                ws.onclose = () => {
+                    setTimeout(connect, 1000);
+                };
+                ws.onerror = () => {
+                    ws.close();
+                };
+            }
+
+            function send(obj) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify(obj));
+                }
+            }
+
+            // --- Mouse interaction ---
+            function setupDrag(canvas) {
+                let dragging = false;
+                let lastX = 0,
+                    lastY = 0;
+
+                canvas.addEventListener("mousedown", (e) => {
+                    dragging = true;
+                    const rect = canvas.getBoundingClientRect();
+                    lastX = (e.clientX - rect.left) / rect.width;
+                    lastY = (e.clientY - rect.top) / rect.height;
+                });
+
+                canvas.addEventListener("mousemove", (e) => {
+                    if (!dragging) return;
+                    const rect = canvas.getBoundingClientRect();
+                    const x = (e.clientX - rect.left) / rect.width;
+                    const y = (e.clientY - rect.top) / rect.height;
+                    let fx = (x - lastX) * 5.0;
+                    let fy = (y - lastY) * 5.0;
+
+                    // Clamp force magnitude to prevent velocity blowup
+                    const mag = Math.sqrt(fx * fx + fy * fy);
+                    if (mag > 1.0) {
+                        fx /= mag;
+                        fy /= mag;
+                    }
+
+                    send({
+                        force: {
+                            fx: fx,
+                            fy: -fy, // flip y (canvas top = field top after flip)
+                            cx: x,
+                            cy: 1.0 - y, // flip y for Fortran coords
+                        },
+                    });
+
+                    lastX = x;
+                    lastY = y;
+                });
+
+                canvas.addEventListener("mouseup", () => {
+                    dragging = false;
+                });
+                canvas.addEventListener("mouseleave", () => {
+                    dragging = false;
+                });
+            }
+
+            setupDrag(canvasStam);
+            setupDrag(canvasCorrected);
+            setupDrag(canvasSpectral);
+
+            // --- Controls ---
+            document.getElementById("btn-clear").onclick = () => {
+                send({ zero_ic: true });
+            };
+
+            document.getElementById("btn-random-ic").onclick = () => {
+                send({ new_ic: Math.floor(Math.random() * 100000) });
+            };
+
+            document.getElementById("btn-pause").onclick = (e) => {
+                isPaused = !isPaused;
+                e.target.classList.toggle("active", isPaused);
+                e.target.textContent = isPaused ? "Resume" : "Pause";
+                send({ paused: isPaused });
+            };
+
+            document.getElementById("sel-mode").onchange = (e) => {
+                send({ ns_mode: e.target.value === "ns" });
+            };
+
+            document.getElementById("sel-model").onchange = (e) => {
+                send({ model: e.target.value });
+                document.getElementById("st-model").textContent =
+                    e.target.value.toUpperCase();
+                // Update corrected panel title
+                const names = {
+                    fno: "FNO-Corrected",
+                    cnn: "CNN-Corrected",
+                    none: "Uncorrected (copy)",
+                };
+                document.querySelector(
+                    "#panel-corrected .panel-title",
+                ).textContent = names[e.target.value] || "Corrected";
+            };
+
+            document.getElementById("sel-display").onchange = (e) => {
+                displayMode = e.target.value;
+                if (currentFrame) renderFrame(currentFrame);
+            };
+
+            document.getElementById("slider-steps").oninput = (e) => {
+                document.getElementById("steps-val").textContent =
+                    e.target.value;
+                send({ steps_per_frame: parseInt(e.target.value) });
+            };
+
+            document.getElementById("slider-alpha").oninput = (e) => {
+                const alpha = parseInt(e.target.value) / 100;
+                document.getElementById("alpha-val").textContent =
+                    alpha.toFixed(2);
+                send({ alpha: alpha });
+            };
+
+            let wallsOn = false;
+            document.getElementById("btn-walls").onclick = (e) => {
+                wallsOn = !wallsOn;
+                e.target.classList.toggle("active", wallsOn);
+                e.target.textContent = wallsOn ? "Walls: On" : "Walls: Off";
+                send({ walls: wallsOn });
+            };
+
+            document.getElementById("btn-spectral").onclick = (e) => {
+                showSpectral = !showSpectral;
+                e.target.classList.toggle("active", showSpectral);
+                document.getElementById("panel-spectral").style.display =
+                    showSpectral ? "" : "none";
+                send({ run_spectral: showSpectral });
+                resizeCanvases();
+            };
+
+            // --- Responsive canvas sizing ---
+            function resizeCanvases() {
+                const main = document.getElementById("main");
+                const h = main.clientHeight - 20; // padding
+
+                // Field canvases: square, fill available height
+                const fieldSize = Math.min(h - 30, 512); // cap at 512px
+                document.querySelectorAll(".field-canvas").forEach((c) => {
+                    c.style.width = fieldSize + "px";
+                    c.style.height = fieldSize + "px";
+                });
+
+                // Colorbar height matches
+                canvasColorbar.style.height = fieldSize - 20 + "px";
+
+                // Spectrum canvas: fill remaining space
+                const specPanel = document.getElementById("spectrum-panel");
+                canvasSpectrum.width = specPanel.clientWidth - 12;
+                canvasSpectrum.height = specPanel.clientHeight - 30;
+            }
+
+            window.addEventListener("resize", resizeCanvases);
+            setTimeout(resizeCanvases, 50);
+
+            // --- Start ---
+            connect();
+        </script>
+    </body>
+</html>

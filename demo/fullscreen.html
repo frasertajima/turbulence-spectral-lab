@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <title>Turbulence Spectral Lab - Fullscreen</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+            body {
+                background: #000;
+                overflow: hidden;
+                height: 100vh;
+                width: 100vw;
+            }
+
+            /* Main canvas fills the viewport */
+            #canvas-main {
+                display: block;
+                width: 100vw;
+                height: 100vh;
+                image-rendering: pixelated;
+                cursor: crosshair;
+            }
+
+            /* Floating controls overlay */
+            #controls {
+                position: fixed;
+                top: 12px;
+                right: 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                background: rgba(22, 33, 62, 0.85);
+                padding: 10px 14px;
+                border-radius: 8px;
+                border: 1px solid rgba(100, 120, 160, 0.3);
+                backdrop-filter: blur(8px);
+                font-family: "Segoe UI", system-ui, sans-serif;
+                font-size: 13px;
+                color: #ccd;
+                transition: opacity 0.3s;
+                z-index: 10;
+            }
+            #controls.hidden {
+                opacity: 0;
+                pointer-events: none;
+            }
+            #controls label {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #controls select,
+            #controls button {
+                background: #0f3460;
+                color: #e0e0e0;
+                border: 1px solid #446;
+                padding: 3px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                cursor: pointer;
+            }
+            #controls button:hover {
+                background: #1a5276;
+            }
+            #controls button.active {
+                background: #e94560;
+                border-color: #e94560;
+            }
+            #controls input[type="range"] {
+                width: 70px;
+            }
+            .row {
+                display: flex;
+                gap: 6px;
+                align-items: center;
+            }
+
+            /* FPS overlay */
+            #fps-display {
+                position: fixed;
+                bottom: 12px;
+                left: 12px;
+                font-family: "JetBrains Mono", monospace;
+                font-size: 14px;
+                color: rgba(200, 200, 200, 0.6);
+                z-index: 10;
+                pointer-events: none;
+            }
+
+            /* Toggle hint */
+            #hint {
+                position: fixed;
+                bottom: 12px;
+                right: 12px;
+                font-size: 11px;
+                color: rgba(150, 150, 170, 0.5);
+                z-index: 10;
+                pointer-events: none;
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="canvas-main" width="128" height="128"></canvas>
+
+        <div id="controls">
+            <div class="row">
+                <button id="btn-clear">Clear</button>
+                <button id="btn-random-ic">Random IC</button>
+                <button id="btn-pause">Pause</button>
+            </div>
+            <label
+                >Model:
+                <select id="sel-model">
+                    <option value="fno" selected>FNO</option>
+                    <option value="cnn">CNN</option>
+                    <option value="none">None</option>
+                </select>
+            </label>
+            <label
+                >Display:
+                <select id="sel-display">
+                    <option value="density" selected>Density</option>
+                    <option value="vorticity">Vorticity</option>
+                    <option value="speed">Speed</option>
+                    <option value="u">u</option>
+                    <option value="v">v</option>
+                </select>
+            </label>
+            <label
+                >&alpha;:
+                <input
+                    type="range"
+                    id="slider-alpha"
+                    min="0"
+                    max="100"
+                    value="100"
+                />
+                <span id="alpha-val">1.00</span>
+            </label>
+            <label
+                >Physics:
+                <select id="sel-mode">
+                    <option value="ns" selected>N-S</option>
+                    <option value="burgers">Burgers</option>
+                </select>
+            </label>
+            <div class="row">
+                <button id="btn-walls" title="Toggle absorbing boundaries">
+                    Walls: Off
+                </button>
+            </div>
+        </div>
+
+        <div id="fps-display">-- fps</div>
+        <div id="hint">Press H to toggle controls</div>
+
+        <script>
+            const NX = 128,
+                NY = 128;
+            const FIELD_BYTES = NX * NY * 4;
+            const SPEC_LEN = NX / 2;
+
+            const canvas = document.getElementById("canvas-main");
+            const ctx = canvas.getContext("2d");
+
+            let ws = null;
+            let displayMode = "density";
+            let isPaused = false;
+            let currentFrame = null;
+
+            // --- Colormaps ---
+            function colormap(t) {
+                t = Math.max(0, Math.min(1, t));
+                let r, g, b;
+                if (t < 0.5) {
+                    const s = t * 2;
+                    r = Math.round(59 + s * 196);
+                    g = Math.round(76 + s * 179);
+                    b = Math.round(192 + s * 63);
+                } else {
+                    const s = (t - 0.5) * 2;
+                    r = Math.round(255 - s * 26);
+                    g = Math.round(255 - s * 186);
+                    b = Math.round(255 - s * 186);
+                }
+                return [r, g, b];
+            }
+
+            function colormapDensity(t) {
+                t = Math.max(0, Math.min(1, t));
+                if (t < 0.5) {
+                    const s = t * 2;
+                    return [0, Math.round(s * 200), Math.round(s * 220)];
+                } else {
+                    const s = (t - 0.5) * 2;
+                    return [
+                        Math.round(s * 255),
+                        Math.round(200 + s * 55),
+                        Math.round(220 + s * 35),
+                    ];
+                }
+            }
+
+            // --- Derived fields ---
+            function computeVorticity(u, v) {
+                const omega = new Float32Array(NX * NY);
+                for (let j = 0; j < NY; j++) {
+                    for (let i = 0; i < NX; i++) {
+                        const ip = (i + 1) % NX,
+                            im = (i - 1 + NX) % NX;
+                        const jp = (j + 1) % NY,
+                            jm = (j - 1 + NY) % NY;
+                        const dvdx = (v[j * NX + ip] - v[j * NX + im]) * 0.5;
+                        const dudy = (u[jp * NX + i] - u[jm * NX + i]) * 0.5;
+                        omega[j * NX + i] = dvdx - dudy;
+                    }
+                }
+                return omega;
+            }
+
+            function computeSpeed(u, v) {
+                const spd = new Float32Array(NX * NY);
+                for (let k = 0; k < NX * NY; k++)
+                    spd[k] = Math.sqrt(u[k] * u[k] + v[k] * v[k]);
+                return spd;
+            }
+
+            function getDisplayField(u, v, rho) {
+                switch (displayMode) {
+                    case "density":
+                        return rho;
+                    case "u":
+                        return u;
+                    case "v":
+                        return v;
+                    case "speed":
+                        return computeSpeed(u, v);
+                    case "vorticity":
+                        return computeVorticity(u, v);
+                    default:
+                        return rho || u;
+                }
+            }
+
+            // --- Rendering ---
+            function renderField(field, vmin, vmax, cmap) {
+                const img = ctx.createImageData(NX, NY);
+                const range = vmax - vmin || 1;
+                for (let j = 0; j < NY; j++) {
+                    for (let i = 0; i < NX; i++) {
+                        const val = field[j * NX + i];
+                        const t = (val - vmin) / range;
+                        const [r, g, b] = cmap(t);
+                        const py = (NY - 1 - j) * NX + i;
+                        const idx = py * 4;
+                        img.data[idx] = r;
+                        img.data[idx + 1] = g;
+                        img.data[idx + 2] = b;
+                        img.data[idx + 3] = 255;
+                    }
+                }
+                ctx.putImageData(img, 0, 0);
+            }
+
+            function symRange(field) {
+                let mx = 0;
+                for (let k = 0; k < field.length; k++) {
+                    const a = Math.abs(field[k]);
+                    if (a > mx) mx = a;
+                }
+                return [-(mx || 1), mx || 1];
+            }
+
+            function posRange(field) {
+                let mx = 0;
+                for (let k = 0; k < field.length; k++)
+                    if (field[k] > mx) mx = field[k];
+                return [0, mx || 1];
+            }
+
+            // --- Parse binary frame (same protocol as index.html) ---
+            function parseFrame(buffer) {
+                const view = new DataView(buffer);
+                let off = 0;
+
+                const frameNumber = view.getInt32(off, true);
+                off += 4;
+                const totalSteps = view.getInt32(off, true);
+                off += 4;
+                const simMs = view.getFloat32(off, true);
+                off += 4;
+                const correctionMs = view.getFloat32(off, true);
+                off += 4;
+                const fps = view.getFloat32(off, true);
+                off += 4;
+                const flags = view.getInt32(off, true);
+                off += 4;
+
+                const hasSpectral = flags & 1;
+                const hasDensity = flags & 2;
+
+                const stamU = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const stamV = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const correctedU = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+                const correctedV = new Float32Array(buffer, off, NX * NY);
+                off += FIELD_BYTES;
+
+                let stamRho = null;
+                if (hasDensity) {
+                    stamRho = new Float32Array(buffer, off, NX * NY);
+                    off += FIELD_BYTES;
+                }
+
+                if (hasSpectral) {
+                    off += FIELD_BYTES * 2;
+                } // skip spectral u,v
+
+                // Skip spectrum data
+                off += SPEC_LEN * 4 * 3; // k, e_stam, e_corr
+                if (hasSpectral) off += SPEC_LEN * 4;
+
+                return {
+                    frameNumber,
+                    fps,
+                    stamU,
+                    stamV,
+                    stamRho,
+                    correctedU,
+                    correctedV,
+                };
+            }
+
+            // --- Render ---
+            function renderFrame(frame) {
+                currentFrame = frame;
+
+                // Use corrected fields by default (that's the point of fullscreen mode)
+                const selModel = document.getElementById("sel-model").value;
+                const u = selModel === "none" ? frame.stamU : frame.correctedU;
+                const v = selModel === "none" ? frame.stamV : frame.correctedV;
+                const field = getDisplayField(u, v, frame.stamRho);
+
+                const isDensity = displayMode === "density";
+                const isPositive = displayMode === "speed" || isDensity;
+                const cmap = isDensity ? colormapDensity : colormap;
+                const [vmin, vmax] = isPositive
+                    ? posRange(field)
+                    : symRange(field);
+
+                renderField(field, vmin, vmax, cmap);
+
+                document.getElementById("fps-display").textContent =
+                    frame.fps.toFixed(0) + " fps";
+            }
+
+            // --- WebSocket ---
+            function connect() {
+                const proto = location.protocol === "https:" ? "wss:" : "ws:";
+                ws = new WebSocket(`${proto}//${location.host}/ws`);
+                ws.binaryType = "arraybuffer";
+                ws.onmessage = (evt) => {
+                    if (evt.data instanceof ArrayBuffer) {
+                        renderFrame(parseFrame(evt.data));
+                    }
+                };
+                ws.onclose = () => setTimeout(connect, 1000);
+                ws.onerror = () => ws.close();
+            }
+
+            function send(obj) {
+                if (ws && ws.readyState === WebSocket.OPEN)
+                    ws.send(JSON.stringify(obj));
+            }
+
+            // --- Mouse interaction ---
+            let dragging = false,
+                lastX = 0,
+                lastY = 0;
+
+            canvas.addEventListener("mousedown", (e) => {
+                dragging = true;
+                const rect = canvas.getBoundingClientRect();
+                lastX = (e.clientX - rect.left) / rect.width;
+                lastY = (e.clientY - rect.top) / rect.height;
+            });
+
+            canvas.addEventListener("mousemove", (e) => {
+                if (!dragging) return;
+                const rect = canvas.getBoundingClientRect();
+                const x = (e.clientX - rect.left) / rect.width;
+                const y = (e.clientY - rect.top) / rect.height;
+                let fx = (x - lastX) * 5.0;
+                let fy = (y - lastY) * 5.0;
+                const mag = Math.sqrt(fx * fx + fy * fy);
+                if (mag > 1.0) {
+                    fx /= mag;
+                    fy /= mag;
+                }
+                send({ force: { fx: fx, fy: -fy, cx: x, cy: 1.0 - y } });
+                lastX = x;
+                lastY = y;
+            });
+
+            canvas.addEventListener("mouseup", () => {
+                dragging = false;
+            });
+            canvas.addEventListener("mouseleave", () => {
+                dragging = false;
+            });
+
+            // Touch support for mobile
+            canvas.addEventListener(
+                "touchstart",
+                (e) => {
+                    e.preventDefault();
+                    dragging = true;
+                    const rect = canvas.getBoundingClientRect();
+                    const t = e.touches[0];
+                    lastX = (t.clientX - rect.left) / rect.width;
+                    lastY = (t.clientY - rect.top) / rect.height;
+                },
+                { passive: false },
+            );
+
+            canvas.addEventListener(
+                "touchmove",
+                (e) => {
+                    e.preventDefault();
+                    if (!dragging) return;
+                    const rect = canvas.getBoundingClientRect();
+                    const t = e.touches[0];
+                    const x = (t.clientX - rect.left) / rect.width;
+                    const y = (t.clientY - rect.top) / rect.height;
+                    let fx = (x - lastX) * 5.0;
+                    let fy = (y - lastY) * 5.0;
+                    const mag = Math.sqrt(fx * fx + fy * fy);
+                    if (mag > 1.0) {
+                        fx /= mag;
+                        fy /= mag;
+                    }
+                    send({ force: { fx: fx, fy: -fy, cx: x, cy: 1.0 - y } });
+                    lastX = x;
+                    lastY = y;
+                },
+                { passive: false },
+            );
+
+            canvas.addEventListener("touchend", () => {
+                dragging = false;
+            });
+
+            // --- Controls ---
+            document.getElementById("btn-clear").onclick = () =>
+                send({ zero_ic: true });
+            document.getElementById("btn-random-ic").onclick = () =>
+                send({ new_ic: Math.floor(Math.random() * 100000) });
+            document.getElementById("btn-pause").onclick = (e) => {
+                isPaused = !isPaused;
+                e.target.classList.toggle("active", isPaused);
+                e.target.textContent = isPaused ? "Resume" : "Pause";
+                send({ paused: isPaused });
+            };
+            document.getElementById("sel-model").onchange = (e) =>
+                send({ model: e.target.value });
+            document.getElementById("sel-display").onchange = (e) => {
+                displayMode = e.target.value;
+                if (currentFrame) renderFrame(currentFrame);
+            };
+            document.getElementById("slider-alpha").oninput = (e) => {
+                const alpha = parseInt(e.target.value) / 100;
+                document.getElementById("alpha-val").textContent =
+                    alpha.toFixed(2);
+                send({ alpha: alpha });
+            };
+            document.getElementById("sel-mode").onchange = (e) =>
+                send({ ns_mode: e.target.value === "ns" });
+
+            let wallsOn = false;
+            document.getElementById("btn-walls").onclick = (e) => {
+                wallsOn = !wallsOn;
+                e.target.classList.toggle("active", wallsOn);
+                e.target.textContent = wallsOn ? "Walls: On" : "Walls: Off";
+                send({ walls: wallsOn });
+            };
+
+            // Toggle controls with H key
+            document.addEventListener("keydown", (e) => {
+                if (e.key === "h" || e.key === "H") {
+                    document
+                        .getElementById("controls")
+                        .classList.toggle("hidden");
+                }
+            });
+
+            // Start
+            connect();
+        </script>
+    </body>
+</html>

@@ -300,6 +300,13 @@ def main():
     )
     parser.add_argument("--model", type=str, default="cnn", choices=["fno", "cnn"])
     parser.add_argument(
+        "--experiment",
+        type=str,
+        default=None,
+        choices=["005", "005b"],
+        help="Experiment shorthand (sets data-dir and output-dir)",
+    )
+    parser.add_argument(
         "--data-dir", type=str, default="../experiments/005_stam_correction/fields/"
     )
     parser.add_argument("--output-dir", type=str, default=None)
@@ -314,6 +321,18 @@ def main():
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--print-every", type=int, default=10)
     args = parser.parse_args()
+
+    # Resolve --experiment shorthand
+    exp_dirs = {
+        "005": "../experiments/005_stam_correction/",
+        "005b": "../experiments/005b_ns_correction/",
+    }
+    if args.experiment is not None:
+        base = exp_dirs[args.experiment]
+        args.data_dir = base + "fields/"
+        if args.output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.output_dir = Path(f"{base}runs/{args.model}_{timestamp}")
 
     # Default output directory
     if args.output_dir is None:

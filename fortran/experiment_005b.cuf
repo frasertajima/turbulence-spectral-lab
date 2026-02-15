@@ -1,0 +1,435 @@
+! experiment_005b.cuf - Navier-Stokes Error Correction: Stam vs Spectral
+!
+! Extension of experiment 005 (Burgers) to incompressible Navier-Stokes.
+!
+! Key difference from 005: both solvers now enforce div(u)=0 via
+! pressure projection. The Stam solver uses Jacobi iteration (approximate),
+! the spectral solver uses Leray projection (exact in Fourier space).
+!
+! This adds a second error source beyond advection dissipation:
+!   1. Advection error: semi-Lagrangian smearing (same as exp 005)
+!   2. Pressure error: Jacobi (20 iter) vs exact spectral projection
+!
+! The pressure error is GLOBAL (elliptic PDE), which should favor FNO
+! over CNN even more strongly than in the Burgers case.
+!
+! ICs are divergence-free (generated via stream function).
+!
+! Compile:
+!   nvfortran -cuda -gpu=cc89 -O3 -lcufft \
+!     spectral_tools.cuf synthetic_turbulence.cuf burgers_solver.cuf \
+!     stam_solver.cuf experiment_005b.cuf -o experiment_005b
+
+! Helper module for divergence-free IC generation (GPU kernels can't live
+! inside a program's contains section in CUDA Fortran)
+module divfree_ic_tools
+    use cudafor
+    use cufft
+    use spectral_tools
+    use synthetic_turbulence
+    implicit none
+contains
+
+    !=========================================================================
+    ! Spectral derivative kernels
+    !=========================================================================
+    attributes(global) subroutine spectral_deriv_x_ic(u_hat, du_hat, kx, nkx, ny_l)
+        complex(sp), intent(in) :: u_hat(nkx, ny_l)
+        complex(sp), intent(out) :: du_hat(nkx, ny_l)
+        real(sp), intent(in) :: kx(nkx)
+        integer, value, intent(in) :: nkx, ny_l
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny_l) return
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * kx(i), &
+                               real(u_hat(i,j)) * kx(i))
+    end subroutine
+
+    attributes(global) subroutine spectral_deriv_y_ic(u_hat, du_hat, ky, nkx, ny_l)
+        complex(sp), intent(in) :: u_hat(nkx, ny_l)
+        complex(sp), intent(out) :: du_hat(nkx, ny_l)
+        real(sp), intent(in) :: ky(ny_l)
+        integer, value, intent(in) :: nkx, ny_l
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny_l) return
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * ky(j), &
+                               real(u_hat(i,j)) * ky(j))
+    end subroutine
+
+    !=========================================================================
+    ! Generate divergence-free IC via stream function
+    !
+    ! psi = random Kolmogorov field (low-k filtered)
+    ! u = d(psi)/dy,  v = -d(psi)/dx
+    ! => du/dx + dv/dy = d²psi/dxdy - d²psi/dxdy = 0  (exactly)
+    !=========================================================================
+    subroutine generate_divfree_ic(u_out, v_out, nx_l, ny_l, Lx, Ly, seed)
+        real(sp), intent(out) :: u_out(nx_l, ny_l), v_out(nx_l, ny_l)
+        integer, intent(in) :: nx_l, ny_l, seed
+        real(sp), intent(in) :: Lx, Ly
+
+        real(sp), device, allocatable :: psi_d(:,:), filt_d(:,:), deriv_d(:,:)
+        complex(sp), device, allocatable :: psi_hat(:,:), deriv_hat(:,:)
+        real(sp), device, allocatable :: kx_d(:), ky_d(:)
+        real(sp), allocatable :: kx_h(:), ky_h(:)
+        integer :: nkx, n_total, n_blocks, ierr, i, j, plan_r2c, plan_c2r
+        real(sp) :: k_ic, scale_factor, u_max_val, norm
+
+        nkx = nx_l / 2 + 1
+        n_total = nkx * ny_l
+        n_blocks = (n_total + 255) / 256
+        norm = 1.0_sp / real(nx_l * ny_l)
+        k_ic = 16.0_sp
+
+        allocate(psi_d(nx_l, ny_l), filt_d(nx_l, ny_l), deriv_d(nx_l, ny_l))
+        allocate(psi_hat(nkx, ny_l), deriv_hat(nkx, ny_l))
+        allocate(kx_d(nkx), ky_d(ny_l))
+        allocate(kx_h(nkx), ky_h(ny_l))
+
+        ! Build wavenumber arrays
+        do i = 1, nkx
+            kx_h(i) = TWO_PI * real(i - 1) / Lx
+        end do
+        do i = 1, ny_l
+            if (i <= ny_l/2 + 1) then
+                ky_h(i) = TWO_PI * real(i - 1) / Ly
+            else
+                ky_h(i) = TWO_PI * real(i - 1 - ny_l) / Ly
+            end if
+        end do
+        kx_d = kx_h
+        ky_d = ky_h
+
+        ! Create FFT plans
+        ierr = cufftPlan2d(plan_r2c, ny_l, nx_l, CUFFT_R2C)
+        ierr = cufftPlan2d(plan_c2r, ny_l, nx_l, CUFFT_C2R)
+
+        ! Generate random stream function (low-k Kolmogorov, filtered)
+        call generate_kolmogorov_2d(psi_d, nx_l, ny_l, seed)
+        call normalize_field_2d(psi_d, nx_l, ny_l)
+        call spectral_filter_2d(psi_d, filt_d, nx_l, ny_l, k_ic, 0)
+
+        ! FFT the filtered stream function
+        ierr = cufftExecR2C(plan_r2c, filt_d, psi_hat)
+
+        ! u = d(psi)/dy: multiply by i*ky
+        call spectral_deriv_y_ic<<<n_blocks, 256>>>(psi_hat, deriv_hat, ky_d, nkx, ny_l)
+        ierr = cufftExecC2R(plan_c2r, deriv_hat, deriv_d)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny_l
+            do i = 1, nx_l
+                deriv_d(i,j) = deriv_d(i,j) * norm
+            end do
+        end do
+        u_out = deriv_d
+
+        ! v = -d(psi)/dx: multiply by i*kx, then negate
+        call spectral_deriv_x_ic<<<n_blocks, 256>>>(psi_hat, deriv_hat, kx_d, nkx, ny_l)
+        ierr = cufftExecC2R(plan_c2r, deriv_hat, deriv_d)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny_l
+            do i = 1, nx_l
+                deriv_d(i,j) = -deriv_d(i,j) * norm
+            end do
+        end do
+        v_out = deriv_d
+
+        ! Scale so max velocity ~ 1.0
+        u_max_val = max(maxval(abs(u_out)), maxval(abs(v_out)))
+        if (u_max_val > 0.0_sp) then
+            scale_factor = 1.0_sp / u_max_val
+            u_out = u_out * scale_factor
+            v_out = v_out * scale_factor
+        end if
+
+        ! Cleanup
+        ierr = cufftDestroy(plan_r2c)
+        ierr = cufftDestroy(plan_c2r)
+        deallocate(psi_d, filt_d, deriv_d, psi_hat, deriv_hat)
+        deallocate(kx_d, ky_d, kx_h, ky_h)
+    end subroutine
+
+end module divfree_ic_tools
+
+
+program experiment_005b
+    use cudafor
+    use cufft
+    use spectral_tools
+    use synthetic_turbulence
+    use divfree_ic_tools
+    use burgers_solver
+    use stam_solver, only: stam_state, stam_init, stam_enable_ns, stam_set_ic, &
+                           stam_step, stam_run, stam_get_u, stam_get_v, stam_cleanup
+    implicit none
+
+    ! Grid size
+    integer, parameter :: nx = 128, ny = 128
+
+    ! Physics
+    real(sp), parameter :: nu = 0.01_sp
+    real(sp), parameter :: Lx = TWO_PI
+    real(sp), parameter :: Ly = TWO_PI
+    real(sp), parameter :: dt = 0.001_sp
+    integer, parameter :: n_evolve = 500
+
+    ! Training samples
+    integer, parameter :: n_samples = 400
+
+    ! Multi-time snapshots
+    integer, parameter :: n_snapshots = 10
+    integer, parameter :: snap_steps(n_snapshots) = &
+        (/ 50, 100, 150, 200, 250, 300, 350, 400, 450, 500 /)
+
+    ! Solver states
+    type(burgers_state) :: spectral
+    type(stam_state) :: stam
+
+    ! Host arrays
+    real(sp), allocatable :: u_h(:,:), v_h(:,:)
+    real(sp), allocatable :: spectral_h(:,:), stam_h(:,:)
+    real(sp), allocatable :: error_h(:,:)
+
+    ! Device arrays
+    real(sp), device, allocatable :: field_d(:,:)
+
+    ! Spectrum
+    real(sp) :: E_k(MAX_BINS), k_vals(MAX_BINS)
+    integer :: n_bins
+
+    ! Timing
+    type(cudaEvent) :: start_event, stop_event
+    real(4) :: elapsed_ms
+
+    ! Variables
+    integer :: sample, ierr, snap_idx, steps_done, steps_to_do, total_pairs
+    real(sp) :: spectral_max, stam_max, error_rms
+    real(sp) :: total_error_rms
+    character(len=256) :: filename, output_dir
+
+    ! GPU info
+    type(cudaDeviceProp) :: prop
+    ierr = cudaGetDeviceProperties(prop, 0)
+
+    print *, "================================================================"
+    print *, "  Experiment 005b: N-S Error Correction (Stam vs Spectral)"
+    print *, "================================================================"
+    print *, ""
+    print *, "GPU: ", trim(prop%name)
+    print *, "Grid:", nx, "x", ny
+    print *, "Viscosity:", nu
+    print *, "Domain: [0, 2pi]^2"
+    print *, "Evolution:", n_evolve, "steps, dt =", dt, ", t_final =", n_evolve * dt
+    print *, "Samples:", n_samples
+    print *, "Mode: Incompressible Navier-Stokes (pressure projection enabled)"
+    print *, ""
+
+    ! Create output directories
+    output_dir = "../experiments/005b_ns_correction/"
+    call execute_command_line("mkdir -p " // trim(output_dir) // "spectra")
+    call execute_command_line("mkdir -p " // trim(output_dir) // "fields")
+
+    ! Allocate host arrays
+    allocate(u_h(nx, ny), v_h(nx, ny))
+    allocate(spectral_h(nx, ny), stam_h(nx, ny))
+    allocate(error_h(nx, ny))
+    allocate(field_d(nx, ny))
+
+    ierr = cudaEventCreate(start_event)
+    ierr = cudaEventCreate(stop_event)
+
+    ! ==========================================
+    ! Part 1: Single detailed analysis
+    ! ==========================================
+    print *, "--- Part 1: Single run comparison (N-S mode) ---"
+    print *, ""
+
+    ierr = cudaEventRecord(start_event, 0)
+
+    ! Initialize both solvers with N-S mode
+    call burgers_init(spectral, nx, ny, nu, Lx, Ly)
+    spectral%use_ns = .true.
+
+    call stam_init(stam, nx, ny, nu, Lx, Ly)
+    call stam_enable_ns(stam)
+
+    ! Generate divergence-free IC and set in both solvers
+    call generate_divfree_ic(u_h, v_h, nx, ny, Lx, Ly, 42)
+    call burgers_set_ic(spectral, u_h, v_h)
+    call stam_set_ic(stam, u_h, v_h)
+
+    ! Save initial spectrum
+    field_d = u_h
+    call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_initial.dat", &
+                        E_k, k_vals, n_bins)
+
+    print '(A,F8.4)', "  Initial max|u|: ", maxval(abs(u_h))
+
+    ! Evolve both
+    print '(A,I6,A)', "  Evolving both solvers for ", n_evolve, " steps..."
+    call burgers_run(spectral, dt, n_evolve)
+    call stam_run(stam, dt, n_evolve)
+
+    ! Extract results
+    call burgers_get_u(spectral, spectral_h)
+    call stam_get_u(stam, stam_h)
+
+    spectral_max = maxval(abs(spectral_h))
+    stam_max = maxval(abs(stam_h))
+    error_h = spectral_h - stam_h
+    error_rms = sqrt(sum(error_h**2) / real(nx * ny))
+
+    print '(A,F8.4)', "  Spectral max|u|: ", spectral_max
+    print '(A,F8.4)', "  Stam max|u|:     ", stam_max
+    print '(A,ES12.4)', "  Error RMS:       ", error_rms
+    print '(A,F8.4)', "  Error max:       ", maxval(abs(error_h))
+
+    ! Stability check
+    if (spectral_max /= spectral_max .or. spectral_max > 1.0e10) then
+        print *, "  ERROR: Spectral solver blew up!"
+        stop 1
+    end if
+    if (stam_max /= stam_max .or. stam_max > 1.0e10) then
+        print *, "  ERROR: Stam solver blew up!"
+        stop 1
+    end if
+
+    ! Save spectra
+    field_d = spectral_h
+    call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_spectral.dat", &
+                        E_k, k_vals, n_bins)
+
+    field_d = stam_h
+    call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_stam.dat", &
+                        E_k, k_vals, n_bins)
+
+    field_d = error_h
+    call compute_energy_spectrum_2d(field_d, nx, ny, E_k, k_vals, n_bins)
+    call write_spectrum(trim(output_dir) // "spectra/spectrum_error.dat", &
+                        E_k, k_vals, n_bins)
+
+    ! Save first sample fields
+    call write_field_2d(trim(output_dir) // "fields/stam_sample_000.bin", stam_h, nx, ny)
+    call write_field_2d(trim(output_dir) // "fields/spectral_sample_000.bin", spectral_h, nx, ny)
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+    print '(A,F8.1,A)', "  Single pair time: ", elapsed_ms, " ms"
+
+    call burgers_cleanup(spectral)
+    call stam_cleanup(stam)
+
+    ! ==========================================
+    ! Part 2: Generate training dataset
+    ! ==========================================
+    print *, ""
+    print *, "--- Part 2: Generating multi-time training dataset (N-S) ---"
+    print '(A,I2,A)', "  Snapshots per IC: ", n_snapshots, " time points"
+    print '(A,I5,A)', "  Total pairs: ", n_samples * n_snapshots, ""
+    print *, ""
+
+    ierr = cudaEventRecord(start_event, 0)
+    total_error_rms = 0.0_sp
+    total_pairs = 0
+
+    do sample = 1, n_samples
+        ! Fresh solvers with N-S mode
+        call burgers_init(spectral, nx, ny, nu, Lx, Ly)
+        spectral%use_ns = .true.
+
+        call stam_init(stam, nx, ny, nu, Lx, Ly)
+        call stam_enable_ns(stam)
+
+        ! Divergence-free IC for both
+        call generate_divfree_ic(u_h, v_h, nx, ny, Lx, Ly, sample * 137 + 7)
+        call burgers_set_ic(spectral, u_h, v_h)
+        call stam_set_ic(stam, u_h, v_h)
+
+        steps_done = 0
+
+        ! Evolve incrementally, saving at each snapshot
+        do snap_idx = 1, n_snapshots
+            steps_to_do = snap_steps(snap_idx) - steps_done
+            call burgers_run(spectral, dt, steps_to_do)
+            call stam_run(stam, dt, steps_to_do)
+            steps_done = snap_steps(snap_idx)
+
+            ! Extract
+            call burgers_get_u(spectral, spectral_h)
+            call stam_get_u(stam, stam_h)
+
+            ! Check for NaN
+            spectral_max = maxval(abs(spectral_h))
+            stam_max = maxval(abs(stam_h))
+
+            if (spectral_max /= spectral_max .or. stam_max /= stam_max .or. &
+                spectral_max > 1.0e10 .or. stam_max > 1.0e10) then
+                print '(A,I4,A,I4,A)', "  Sample ", sample, " step ", steps_done, " BLEW UP"
+                exit
+            end if
+
+            total_pairs = total_pairs + 1
+
+            write(filename, '(A,A,I3.3,A,I3.3,A)') trim(output_dir), &
+                  "fields/stam_sample_", sample, "_", snap_steps(snap_idx), ".bin"
+            call write_field_2d(trim(filename), stam_h, nx, ny)
+
+            write(filename, '(A,A,I3.3,A,I3.3,A)') trim(output_dir), &
+                  "fields/spectral_sample_", sample, "_", snap_steps(snap_idx), ".bin"
+            call write_field_2d(trim(filename), spectral_h, nx, ny)
+
+            error_rms = sqrt(sum((spectral_h - stam_h)**2) / real(nx * ny))
+            total_error_rms = total_error_rms + error_rms
+        end do
+
+        if (mod(sample, 100) == 0) then
+            print '(A,I4,A,I4,A,I5,A)', "    IC ", sample, " / ", n_samples, &
+                  "  (", total_pairs, " pairs so far)"
+        end if
+
+        call burgers_cleanup(spectral)
+        call stam_cleanup(stam)
+    end do
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+    print *, ""
+    print '(A,I5,A,F8.1,A)', "  Generated ", total_pairs, " pairs in ", elapsed_ms / 1000.0, " s"
+    print '(A,F8.1,A)', "  Rate: ", elapsed_ms / real(n_samples), " ms/IC"
+    print '(A,ES10.3)', "  Average error RMS: ", total_error_rms / real(total_pairs)
+
+    ! ==========================================
+    ! Done
+    ! ==========================================
+    print *, ""
+    print *, "================================================================"
+    print *, "  Experiment 005b Data Generation Complete"
+    print *, "================================================================"
+    print *, ""
+    print *, "  Output in: ", trim(output_dir)
+    print *, ""
+    print *, "  Next:"
+    print *, "  cd ../python"
+    print *, "  python train_correction.py --experiment 005b --model cnn --epochs 100"
+    print *, "  python train_correction.py --experiment 005b --model fno --epochs 100"
+    print *, ""
+
+    ! Cleanup
+    deallocate(u_h, v_h, spectral_h, stam_h, error_h, field_d)
+    ierr = cudaEventDestroy(start_event)
+    ierr = cudaEventDestroy(stop_event)
+
+end program experiment_005b

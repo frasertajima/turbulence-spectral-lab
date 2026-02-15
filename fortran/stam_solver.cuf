@@ -1,12 +1,17 @@
-! stam_solver.cuf - Semi-Lagrangian Burgers solver (Stam's "Stable Fluids" method)
+! stam_solver.cuf - Semi-Lagrangian solver (Stam's "Stable Fluids" method)
 !
-! Solves the 2D viscous Burgers equation using:
+! Supports two modes:
+!   - Burgers (use_ns=.false., default): du/dt + u*grad(u) = nu*laplacian(u)
+!   - Incompressible N-S (use_ns=.true.): adds pressure projection for div(u)=0
+!
+! Method:
 !   - Semi-Lagrangian advection (backtrace + bilinear interpolation)
 !   - Implicit Jacobi diffusion
+!   - Jacobi pressure Poisson solve (N-S mode only)
 !   - Periodic boundary conditions
 !
 ! This is deliberately dissipative: the semi-Lagrangian scheme smears
-! gradients, and Jacobi diffusion adds numerical viscosity. The ERROR
+! gradients, and Jacobi diffusion/pressure add numerical error. The ERROR
 ! relative to the pseudo-spectral solver (burgers_solver.cuf) is what
 ! we want to learn to correct with a neural network.
 !
@@ -28,10 +33,24 @@ module stam_solver
         real(sp) :: nu        ! viscosity
         real(sp) :: Lx, Ly    ! domain size
         real(sp) :: dx, dy    ! grid spacing
+        logical :: use_ns     ! .true. = incompressible N-S (with pressure projection)
+                              ! .false. = Burgers (no projection, default)
 
         ! Velocity fields (device)
         real(sp), device, allocatable :: u(:,:), v(:,:)
         real(sp), device, allocatable :: u_prev(:,:), v_prev(:,:)
+
+        ! Pressure projection work arrays (allocated only when use_ns=.true.)
+        real(sp), device, allocatable :: p(:,:), div(:,:)
+
+        ! Wall boundary mode (clamp instead of periodic wrap)
+        logical :: use_walls = .false.
+
+        ! Passive density tracer (allocated only when has_density=.true.)
+        logical :: has_density = .false.
+        real(sp) :: diffusion_rho = 0.0_sp   ! density diffusion coefficient
+        real(sp) :: decay_rho = 0.0_sp       ! density decay rate (per second)
+        real(sp), device, allocatable :: rho(:,:), rho_prev(:,:)
     end type
 
 contains
@@ -51,6 +70,7 @@ contains
         state%Ly = Ly
         state%dx = Lx / real(nx, sp)
         state%dy = Ly / real(ny, sp)
+        state%use_ns = .false.   ! default: Burgers (no pressure projection)
 
         allocate(state%u(nx, ny), state%v(nx, ny))
         allocate(state%u_prev(nx, ny), state%v_prev(nx, ny))
@@ -59,6 +79,66 @@ contains
         state%v = 0.0_sp
         state%u_prev = 0.0_sp
         state%v_prev = 0.0_sp
+    end subroutine
+
+    !=========================================================================
+    ! Enable Navier-Stokes mode (allocate pressure arrays)
+    !=========================================================================
+    subroutine stam_enable_ns(state)
+        type(stam_state), intent(inout) :: state
+
+        state%use_ns = .true.
+        if (.not. allocated(state%p)) then
+            allocate(state%p(state%nx, state%ny))
+            allocate(state%div(state%nx, state%ny))
+            state%p = 0.0_sp
+            state%div = 0.0_sp
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Enable/disable absorbing (open) boundaries
+    !=========================================================================
+    subroutine stam_set_walls(state, enabled)
+        type(stam_state), intent(inout) :: state
+        logical, intent(in) :: enabled
+
+        state%use_walls = enabled
+    end subroutine
+
+    !=========================================================================
+    ! Enable passive density tracer (allocate arrays, set params)
+    !=========================================================================
+    subroutine stam_enable_density(state, diffusion, decay)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: diffusion, decay
+
+        state%has_density = .true.
+        state%diffusion_rho = diffusion
+        state%decay_rho = decay
+        if (.not. allocated(state%rho)) then
+            allocate(state%rho(state%nx, state%ny))
+            allocate(state%rho_prev(state%nx, state%ny))
+            state%rho = 0.0_sp
+            state%rho_prev = 0.0_sp
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Get/set density (copy between device and host)
+    !=========================================================================
+    subroutine stam_get_rho(state, rho_h)
+        type(stam_state), intent(in) :: state
+        real(sp), intent(out) :: rho_h(state%nx, state%ny)
+
+        rho_h = state%rho
+    end subroutine
+
+    subroutine stam_set_rho(state, rho_h)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: rho_h(state%nx, state%ny)
+
+        state%rho = rho_h
     end subroutine
 
     !=========================================================================
@@ -179,13 +259,171 @@ contains
     end subroutine
 
     !=========================================================================
-    ! One timestep: swap -> diffuse -> advect
+    ! Absorbing boundary kernel: zero out a strip of width `w` at all edges
+    ! Applied to any 2D field (velocity or density) when use_walls=.true.
+    !=========================================================================
+    attributes(global) subroutine absorb_boundary_kernel(f, w, nx, ny)
+        real(sp), device, intent(inout) :: f(nx, ny)
+        integer, value, intent(in) :: w, nx, ny
+
+        integer :: i, j
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        if (i <= w .or. i > nx - w .or. j <= w .or. j > ny - w) then
+            f(i, j) = 0.0_sp
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Decay kernel: rho = rho * (1 - decay_rate * dt)
+    ! Applied per-element to fade old dye
+    !=========================================================================
+    attributes(global) subroutine decay_kernel(rho, decay_rate, dt, nx, ny)
+        real(sp), device, intent(inout) :: rho(nx, ny)
+        real(sp), value, intent(in) :: decay_rate, dt
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        rho(i, j) = rho(i, j) * (1.0_sp - decay_rate * dt)
+    end subroutine
+
+    !=========================================================================
+    ! Divergence kernel (periodic BCs)
+    ! Computes div = -(du/dx + dv/dy) via central differences
+    ! Sign convention matches fluid_dynamics.cuf: div includes the -0.5*h factor
+    !=========================================================================
+    attributes(global) subroutine divergence_periodic_kernel(u, v, div, nx, ny)
+        real(sp), device, intent(in) :: u(nx, ny), v(nx, ny)
+        real(sp), device, intent(out) :: div(nx, ny)
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j, im, ip, jm, jp
+        real(sp) :: h
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        ! Periodic neighbors
+        im = i - 1; if (im < 1) im = nx
+        ip = i + 1; if (ip > nx) ip = 1
+        jm = j - 1; if (jm < 1) jm = ny
+        jp = j + 1; if (jp > ny) jp = 1
+
+        h = 1.0_sp / real(nx, sp)
+        div(i, j) = -0.5_sp * h * (u(ip, j) - u(im, j) + v(i, jp) - v(i, jm))
+    end subroutine
+
+    !=========================================================================
+    ! Pressure Poisson solve via Jacobi iteration (periodic BCs)
+    ! Solves nabla^2 p = div
+    ! p(i,j) = (div(i,j) + p(neighbors)) / 4
+    !=========================================================================
+    attributes(global) subroutine pressure_solve_periodic_kernel(p, div, nx, ny)
+        real(sp), device, intent(inout) :: p(nx, ny)
+        real(sp), device, intent(in) :: div(nx, ny)
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j, im, ip, jm, jp, k
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        ! Periodic neighbors
+        im = i - 1; if (im < 1) im = nx
+        ip = i + 1; if (ip > nx) ip = 1
+        jm = j - 1; if (jm < 1) jm = ny
+        jp = j + 1; if (jp > ny) jp = 1
+
+        do k = 1, STAM_DIFFUSE_ITERS
+            p(i, j) = (div(i, j) + p(ip, j) + p(im, j) + &
+                        p(i, jp) + p(i, jm)) / 4.0_sp
+            call syncthreads()
+        end do
+    end subroutine
+
+    !=========================================================================
+    ! Subtract pressure gradient from velocity (periodic BCs)
+    ! u -= 0.5 * (p(i+1) - p(i-1)) / h
+    ! v -= 0.5 * (p(j+1) - p(j-1)) / h
+    !=========================================================================
+    attributes(global) subroutine gradient_subtract_periodic_kernel(u, v, p, nx, ny)
+        real(sp), device, intent(inout) :: u(nx, ny), v(nx, ny)
+        real(sp), device, intent(in) :: p(nx, ny)
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j, im, ip, jm, jp
+        real(sp) :: h
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        ! Periodic neighbors
+        im = i - 1; if (im < 1) im = nx
+        ip = i + 1; if (ip > nx) ip = 1
+        jm = j - 1; if (jm < 1) jm = ny
+        jp = j + 1; if (jp > ny) jp = 1
+
+        h = 1.0_sp / real(nx, sp)
+        u(i, j) = u(i, j) - 0.5_sp * (p(ip, j) - p(im, j)) / h
+        v(i, j) = v(i, j) - 0.5_sp * (p(i, jp) - p(i, jm)) / h
+    end subroutine
+
+    !=========================================================================
+    ! Pressure projection: make velocity field divergence-free
+    ! 1. Compute divergence
+    ! 2. Solve Poisson equation for pressure (Jacobi)
+    ! 3. Subtract pressure gradient from velocity
+    !=========================================================================
+    subroutine stam_project(state)
+        type(stam_state), intent(inout) :: state
+
+        integer :: nx_l, ny_l, ierr
+        type(dim3) :: grid, block
+
+        nx_l = state%nx
+        ny_l = state%ny
+
+        block = dim3(16, 16, 1)
+        grid = dim3((nx_l + 15) / 16, (ny_l + 15) / 16, 1)
+
+        ! Reset pressure
+        state%p = 0.0_sp
+
+        ! 1. Compute divergence
+        call divergence_periodic_kernel<<<grid, block>>>( &
+            state%u, state%v, state%div, nx_l, ny_l)
+        ierr = cudaDeviceSynchronize()
+
+        ! 2. Solve for pressure
+        call pressure_solve_periodic_kernel<<<grid, block>>>( &
+            state%p, state%div, nx_l, ny_l)
+        ierr = cudaDeviceSynchronize()
+
+        ! 3. Subtract pressure gradient
+        call gradient_subtract_periodic_kernel<<<grid, block>>>( &
+            state%u, state%v, state%p, nx_l, ny_l)
+        ierr = cudaDeviceSynchronize()
+    end subroutine
+
+    !=========================================================================
+    ! One timestep
     !
-    ! This is the Stam "Stable Fluids" ordering for Burgers:
-    ! 1. Copy current to prev
-    ! 2. Diffuse prev -> current (implicit viscosity)
-    ! 3. Swap again (so advection reads from diffused field)
-    ! 4. Advect prev -> current (semi-Lagrangian)
+    ! Burgers mode (use_ns=.false.):
+    !   diffuse -> advect
+    !
+    ! N-S mode (use_ns=.true., matches fluid_dynamics.cuf):
+    !   diffuse -> project -> advect -> project
     !=========================================================================
     subroutine stam_step(state, dt)
         type(stam_state), intent(inout) :: state
@@ -217,16 +455,56 @@ contains
         call diffuse_periodic_kernel<<<grid, block>>>(state%v, state%v_prev, a, nx_l, ny_l)
         ierr = cudaDeviceSynchronize()
 
+        ! --- Step 2b (N-S only): Project after diffusion ---
+        if (state%use_ns) call stam_project(state)
+
         ! --- Step 3: Swap for advection ---
         state%u_prev = state%u
         state%v_prev = state%v
 
-        ! --- Step 4: Advect (semi-Lagrangian, self-advection for Burgers) ---
+        ! --- Step 4: Advect (semi-Lagrangian) ---
         call advect_periodic_kernel<<<grid, block>>>( &
             state%u, state%u_prev, state%u_prev, state%v_prev, dt, nx_l, ny_l)
         call advect_periodic_kernel<<<grid, block>>>( &
             state%v, state%v_prev, state%u_prev, state%v_prev, dt, nx_l, ny_l)
         ierr = cudaDeviceSynchronize()
+
+        ! --- Step 4b (N-S only): Project after advection ---
+        if (state%use_ns) call stam_project(state)
+
+        ! --- Step 5: Density tracer (passive scalar) ---
+        if (state%has_density) then
+            ! Diffuse density
+            a = dt * state%diffusion_rho * real(nx_l, sp) * real(nx_l, sp)
+            state%rho_prev = state%rho
+            state%rho = state%rho_prev
+            call diffuse_periodic_kernel<<<grid, block>>>( &
+                state%rho, state%rho_prev, a, nx_l, ny_l)
+            ierr = cudaDeviceSynchronize()
+
+            ! Advect density by velocity field
+            state%rho_prev = state%rho
+            call advect_periodic_kernel<<<grid, block>>>( &
+                state%rho, state%rho_prev, state%u, state%v, dt, nx_l, ny_l)
+            ierr = cudaDeviceSynchronize()
+
+            ! Decay (fade old dye)
+            if (state%decay_rho > 0.0_sp) then
+                call decay_kernel<<<grid, block>>>( &
+                    state%rho, state%decay_rho, dt, nx_l, ny_l)
+                ierr = cudaDeviceSynchronize()
+            end if
+        end if
+
+        ! --- Step 6: Absorbing boundaries (zero edges so fluid doesn't wrap) ---
+        if (state%use_walls) then
+            call absorb_boundary_kernel<<<grid, block>>>(state%u, 2, nx_l, ny_l)
+            call absorb_boundary_kernel<<<grid, block>>>(state%v, 2, nx_l, ny_l)
+            if (state%has_density) then
+                call absorb_boundary_kernel<<<grid, block>>>(state%rho, 2, nx_l, ny_l)
+            end if
+            ierr = cudaDeviceSynchronize()
+        end if
     end subroutine
 
     !=========================================================================
@@ -253,6 +531,10 @@ contains
         if (allocated(state%v)) deallocate(state%v)
         if (allocated(state%u_prev)) deallocate(state%u_prev)
         if (allocated(state%v_prev)) deallocate(state%v_prev)
+        if (allocated(state%p)) deallocate(state%p)
+        if (allocated(state%div)) deallocate(state%div)
+        if (allocated(state%rho)) deallocate(state%rho)
+        if (allocated(state%rho_prev)) deallocate(state%rho_prev)
     end subroutine
 
 end module stam_solver

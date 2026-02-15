@@ -1,13 +1,16 @@
-! burgers_solver.cuf - 2D viscous Burgers equation solver (pseudo-spectral)
+! burgers_solver.cuf - 2D pseudo-spectral solver (Burgers / incompressible N-S)
 !
-! Solves:
-!   du/dt + u * du/dx + v * du/dy = nu * (d²u/dx² + d²u/dy²)
-!   dv/dt + u * dv/dx + v * dv/dy = nu * (d²v/dx² + d²v/dy²)
+! Supports two modes:
+!   Burgers (use_ns=.false., default):
+!     du/dt + u * du/dx + v * du/dy = nu * (d²u/dx² + d²u/dy²)
+!   Incompressible N-S (use_ns=.true.):
+!     Same + Leray pressure projection after each step (exact div(u)=0)
 !
 ! Method:
 !   - Spatial derivatives via FFT (spectral accuracy)
 !   - Time integration: RK4 (4th order Runge-Kutta)
 !   - Dealiasing: 2/3 rule (zero padding high modes)
+!   - Leray projection in Fourier space (N-S mode only)
 !   - Periodic boundary conditions
 !
 ! Why Burgers: The nonlinear advection u*du/dx creates cross-scale
@@ -30,6 +33,7 @@ module burgers_solver
         real(sp) :: nu          ! viscosity
         real(sp) :: Lx, Ly      ! domain size
         real(sp) :: dx, dy
+        logical :: use_ns       ! .true. = incompressible N-S (Leray projection after each step)
 
         ! Fields on device (velocity components)
         real(sp), device, allocatable :: u(:,:), v(:,:)
@@ -69,6 +73,7 @@ contains
         state%Ly = Ly
         state%dx = Lx / real(nx)
         state%dy = Ly / real(ny)
+        state%use_ns = .false.   ! default: Burgers (no projection)
 
         nkx = nx/2 + 1
 
@@ -338,6 +343,95 @@ contains
     end subroutine
 
     !=========================================================================
+    ! Leray projection kernel: remove divergent component in Fourier space
+    !
+    ! u_hat = u_hat - kx * (kx*u_hat + ky*v_hat) / k^2
+    ! v_hat = v_hat - ky * (kx*u_hat + ky*v_hat) / k^2
+    !
+    ! This makes the velocity field divergence-free (exact in spectral space).
+    ! Applied to both u_hat and v_hat simultaneously.
+    !=========================================================================
+    attributes(global) subroutine leray_project_kernel(u_hat, v_hat, kx, ky, nkx, ny)
+        complex(sp), intent(inout) :: u_hat(nkx, ny), v_hat(nkx, ny)
+        real(sp), intent(in) :: kx(nkx), ky(ny)
+        integer, value, intent(in) :: nkx, ny
+
+        integer :: i, j, idx
+        real(sp) :: kx_l, ky_l, k2
+        complex(sp) :: proj
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        kx_l = kx(i)
+        ky_l = ky(j)
+        k2 = kx_l**2 + ky_l**2
+
+        if (k2 > 1.0e-10_sp) then
+            ! Component of velocity parallel to wavevector (the divergent part).
+            ! The i factor from spectral derivatives cancels in the ratio,
+            ! so we just use kx*u_hat + ky*v_hat directly.
+            proj = (kx_l * u_hat(i,j) + ky_l * v_hat(i,j)) / k2
+            u_hat(i,j) = u_hat(i,j) - kx_l * proj
+            v_hat(i,j) = v_hat(i,j) - ky_l * proj
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Apply Leray projection to make velocity divergence-free
+    ! FFT -> project in spectral space -> IFFT
+    !=========================================================================
+    subroutine burgers_project(state)
+        type(burgers_state), intent(inout) :: state
+
+        integer :: nx, ny, nkx, n_total, n_blocks, ierr, i, j
+        real(sp) :: norm
+        complex(sp), device, allocatable :: u_hat_tmp(:,:), v_hat_tmp(:,:)
+        real(sp), device, allocatable :: u_tmp(:,:), v_tmp(:,:)
+
+        nx = state%nx
+        ny = state%ny
+        nkx = nx / 2 + 1
+        n_total = nkx * ny
+        n_blocks = (n_total + 255) / 256
+        norm = 1.0_sp / real(nx * ny)
+
+        allocate(u_hat_tmp(nkx, ny), v_hat_tmp(nkx, ny))
+        allocate(u_tmp(nx, ny), v_tmp(nx, ny))
+
+        ! Forward FFT both components
+        ierr = cufftExecR2C(state%plan_r2c, state%u, u_hat_tmp)
+        ierr = cufftExecR2C(state%plan_r2c, state%v, v_hat_tmp)
+
+        ! Leray projection in Fourier space
+        call leray_project_kernel<<<n_blocks, 256>>>( &
+            u_hat_tmp, v_hat_tmp, state%kx_d, state%ky_d, nkx, ny)
+        ierr = cudaDeviceSynchronize()
+
+        ! Inverse FFT into temporaries (avoid CUF kernel bug with derived type members)
+        ierr = cufftExecC2R(state%plan_c2r, u_hat_tmp, u_tmp)
+        ierr = cufftExecC2R(state%plan_c2r, v_hat_tmp, v_tmp)
+
+        ! Normalize
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                u_tmp(i,j) = u_tmp(i,j) * norm
+                v_tmp(i,j) = v_tmp(i,j) * norm
+            end do
+        end do
+
+        ! Copy back to state
+        state%u = u_tmp
+        state%v = v_tmp
+
+        deallocate(u_hat_tmp, v_hat_tmp, u_tmp, v_tmp)
+    end subroutine
+
+    !=========================================================================
     ! RK4 time step
     !=========================================================================
     subroutine burgers_step_rk4(state, dt)
@@ -385,6 +479,9 @@ contains
         call rk4_update<<<n_blocks, 256>>>(state%u, k1u, k2u, k3u, k4u, dt, nx, ny)
         call rk4_update<<<n_blocks, 256>>>(state%v, k1v, k2v, k3v, k4v, dt, nx, ny)
         ierr = cudaDeviceSynchronize()
+
+        ! N-S mode: enforce divergence-free velocity after RK4 update
+        if (state%use_ns) call burgers_project(state)
 
         deallocate(k1u, k1v, k2u, k2v, k3u, k3v, k4u, k4v)
         deallocate(u_stage, v_stage)
@@ -446,6 +543,12 @@ contains
         type(burgers_state), intent(in) :: state
         real(sp), intent(out) :: u_h(state%nx, state%ny)
         u_h = state%u
+    end subroutine
+
+    subroutine burgers_get_v(state, v_h)
+        type(burgers_state), intent(in) :: state
+        real(sp), intent(out) :: v_h(state%nx, state%ny)
+        v_h = state%v
     end subroutine
 
     !=========================================================================

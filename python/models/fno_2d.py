@@ -157,10 +157,20 @@ class SimpleCNN(nn.Module):
 
     def __init__(self, n_channels=32, n_layers=4):
         super().__init__()
-        layers = [nn.Conv2d(1, n_channels, 3, padding=1), nn.GELU()]
+        layers = [
+            nn.Conv2d(1, n_channels, 3, padding=1, padding_mode="circular"),
+            nn.GELU(),
+        ]
         for _ in range(n_layers - 2):
-            layers.extend([nn.Conv2d(n_channels, n_channels, 3, padding=1), nn.GELU()])
-        layers.append(nn.Conv2d(n_channels, 1, 3, padding=1))
+            layers.extend(
+                [
+                    nn.Conv2d(
+                        n_channels, n_channels, 3, padding=1, padding_mode="circular"
+                    ),
+                    nn.GELU(),
+                ]
+            )
+        layers.append(nn.Conv2d(n_channels, 1, 3, padding=1, padding_mode="circular"))
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):

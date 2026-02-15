@@ -14,6 +14,7 @@ Two modes:
   Mode 2: "Online" — Correct for display at intervals, Stam runs uncorrected
 """
 
+import argparse
 import ctypes
 import sys
 import time
@@ -35,8 +36,17 @@ CORRECT_EVERY = 10  # apply CNN correction every K Stam steps
 SEED = 9999  # different from training seeds
 FORTRAN_LIB = str(Path(__file__).parent / "../fortran/realtime_solvers.so")
 
-# Find the trained CNN model
-RUNS_DIR = Path(__file__).parent / "../experiments/005_stam_correction/runs"
+# Parse --ns flag early so we can set RUNS_DIR
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--ns", action="store_true", help="Use N-S mode (experiment 005b)")
+_args, _ = _parser.parse_known_args()
+NS_MODE = _args.ns
+
+if NS_MODE:
+    RUNS_DIR = Path(__file__).parent / "../experiments/005b_ns_correction/runs"
+else:
+    RUNS_DIR = Path(__file__).parent / "../experiments/005_stam_correction/runs"
+
 cnn_dirs = sorted(RUNS_DIR.glob("cnn_*"))
 fno_dirs = sorted(RUNS_DIR.glob("fno_*"))
 
@@ -63,7 +73,11 @@ def run_test(model, model_name, lib, correct_every):
 
     # Initialize both solvers with same IC
     lib.rt_init(ctypes.c_int(N), ctypes.c_int(N), ctypes.c_float(NU))
-    lib.rt_set_ic_from_seed(ctypes.c_int(SEED))
+    if NS_MODE:
+        lib.rt_set_ns_mode(ctypes.c_int(1))
+        lib.rt_set_ic_from_seed_ns(ctypes.c_int(SEED))
+    else:
+        lib.rt_set_ic_from_seed(ctypes.c_int(SEED))
 
     # Buffers for field extraction
     spectral_buf = np.zeros((N, N), dtype=np.float32)
@@ -146,9 +160,14 @@ def main():
     lib.rt_set_stam_u.restype = None
     lib.rt_cleanup.argtypes = []
     lib.rt_cleanup.restype = None
+    lib.rt_set_ns_mode.argtypes = [ctypes.c_int]
+    lib.rt_set_ns_mode.restype = None
+    lib.rt_set_ic_from_seed_ns.argtypes = [ctypes.c_int]
+    lib.rt_set_ic_from_seed_ns.restype = None
 
+    mode_str = "Navier-Stokes" if NS_MODE else "Burgers"
     print("=" * 70)
-    print("  Real-Time CNN Correction Test: Stam + CNN vs Spectral")
+    print(f"  Real-Time CNN Correction Test: Stam + CNN vs Spectral ({mode_str})")
     print("=" * 70)
     print(f"  Grid: {N}x{N}, nu={NU}, dt={DT}")
     print(f"  Total steps: {TOTAL_STEPS}, Correct every: {CORRECT_EVERY} steps")
