@@ -1,0 +1,258 @@
+! stam_solver.cuf - Semi-Lagrangian Burgers solver (Stam's "Stable Fluids" method)
+!
+! Solves the 2D viscous Burgers equation using:
+!   - Semi-Lagrangian advection (backtrace + bilinear interpolation)
+!   - Implicit Jacobi diffusion
+!   - Periodic boundary conditions
+!
+! This is deliberately dissipative: the semi-Lagrangian scheme smears
+! gradients, and Jacobi diffusion adds numerical viscosity. The ERROR
+! relative to the pseudo-spectral solver (burgers_solver.cuf) is what
+! we want to learn to correct with a neural network.
+!
+! Compile (as part of experiment_005):
+!   nvfortran -cuda -gpu=cc89 -O3 -lcufft \
+!     spectral_tools.cuf synthetic_turbulence.cuf burgers_solver.cuf \
+!     stam_solver.cuf experiment_005.cuf -o experiment_005
+
+module stam_solver
+    use cudafor
+    use spectral_tools, only: sp
+    implicit none
+
+    ! Jacobi iterations for diffusion (matches fluid_dynamics.cuf)
+    integer, parameter :: STAM_DIFFUSE_ITERS = 20
+
+    type :: stam_state
+        integer :: nx, ny
+        real(sp) :: nu        ! viscosity
+        real(sp) :: Lx, Ly    ! domain size
+        real(sp) :: dx, dy    ! grid spacing
+
+        ! Velocity fields (device)
+        real(sp), device, allocatable :: u(:,:), v(:,:)
+        real(sp), device, allocatable :: u_prev(:,:), v_prev(:,:)
+    end type
+
+contains
+
+    !=========================================================================
+    ! Initialize solver state
+    !=========================================================================
+    subroutine stam_init(state, nx, ny, nu, Lx, Ly)
+        type(stam_state), intent(inout) :: state
+        integer, intent(in) :: nx, ny
+        real(sp), intent(in) :: nu, Lx, Ly
+
+        state%nx = nx
+        state%ny = ny
+        state%nu = nu
+        state%Lx = Lx
+        state%Ly = Ly
+        state%dx = Lx / real(nx, sp)
+        state%dy = Ly / real(ny, sp)
+
+        allocate(state%u(nx, ny), state%v(nx, ny))
+        allocate(state%u_prev(nx, ny), state%v_prev(nx, ny))
+
+        state%u = 0.0_sp
+        state%v = 0.0_sp
+        state%u_prev = 0.0_sp
+        state%v_prev = 0.0_sp
+    end subroutine
+
+    !=========================================================================
+    ! Set initial condition from host arrays
+    !=========================================================================
+    subroutine stam_set_ic(state, u_h, v_h)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: u_h(state%nx, state%ny)
+        real(sp), intent(in) :: v_h(state%nx, state%ny)
+
+        state%u = u_h
+        state%v = v_h
+    end subroutine
+
+    !=========================================================================
+    ! Get solution (copy u from device to host)
+    !=========================================================================
+    subroutine stam_get_u(state, u_h)
+        type(stam_state), intent(in) :: state
+        real(sp), intent(out) :: u_h(state%nx, state%ny)
+
+        u_h = state%u
+    end subroutine
+
+    subroutine stam_get_v(state, v_h)
+        type(stam_state), intent(in) :: state
+        real(sp), intent(out) :: v_h(state%nx, state%ny)
+
+        v_h = state%v
+    end subroutine
+
+    !=========================================================================
+    ! Semi-Lagrangian advection kernel (periodic BCs)
+    !
+    ! For Burgers: velocity advects itself (u advects u, v advects v)
+    ! Backtrace: x_old = x - dt * u(x)
+    ! Bilinear interpolation from source field at x_old
+    ! Periodic wrap via modulo
+    !=========================================================================
+    attributes(global) subroutine advect_periodic_kernel(d_out, d0, u, v, dt, nx, ny)
+        real(sp), device, intent(out) :: d_out(nx, ny)
+        real(sp), device, intent(in) :: d0(nx, ny), u(nx, ny), v(nx, ny)
+        real(sp), value, intent(in) :: dt
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j
+        real(sp) :: x, y, s0, s1, t0, t1
+        integer :: i0, j0, i1, j1
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        ! Backtrace: where did this fluid parcel come from?
+        ! Position in grid units (1-indexed)
+        x = real(i, sp) - dt * real(nx, sp) * u(i, j)
+        y = real(j, sp) - dt * real(ny, sp) * v(i, j)
+
+        ! Periodic wrap to [1, nx+1) range, then get integer/fractional parts
+        x = modulo(x - 1.0_sp, real(nx, sp)) + 1.0_sp
+        y = modulo(y - 1.0_sp, real(ny, sp)) + 1.0_sp
+
+        ! Integer indices for bilinear interpolation
+        i0 = int(x)
+        j0 = int(y)
+        if (i0 < 1) i0 = nx
+        if (i0 > nx) i0 = 1
+        if (j0 < 1) j0 = ny
+        if (j0 > ny) j0 = 1
+
+        ! Periodic wrap for i0+1, j0+1
+        i1 = i0 + 1
+        j1 = j0 + 1
+        if (i1 > nx) i1 = 1
+        if (j1 > ny) j1 = 1
+
+        ! Interpolation weights
+        s1 = x - real(i0, sp)
+        s0 = 1.0_sp - s1
+        t1 = y - real(j0, sp)
+        t0 = 1.0_sp - t1
+
+        ! Bilinear interpolation
+        d_out(i, j) = s0 * (t0 * d0(i0, j0) + t1 * d0(i0, j1)) + &
+                      s1 * (t0 * d0(i1, j0) + t1 * d0(i1, j1))
+    end subroutine
+
+    !=========================================================================
+    ! Jacobi diffusion kernel (periodic BCs)
+    !
+    ! Solves: x = x0 + a * laplacian(x)  implicitly via iteration
+    ! a = dt * nu * N * N  (scaled for grid spacing)
+    !=========================================================================
+    attributes(global) subroutine diffuse_periodic_kernel(x, x0, a, nx, ny)
+        real(sp), device, intent(inout) :: x(nx, ny)
+        real(sp), device, intent(in) :: x0(nx, ny)
+        real(sp), value, intent(in) :: a
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j, im, ip, jm, jp, k
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        ! Periodic neighbors
+        im = i - 1; if (im < 1) im = nx
+        ip = i + 1; if (ip > nx) ip = 1
+        jm = j - 1; if (jm < 1) jm = ny
+        jp = j + 1; if (jp > ny) jp = 1
+
+        ! Jacobi iteration (in-place with syncthreads)
+        do k = 1, STAM_DIFFUSE_ITERS
+            x(i, j) = (x0(i, j) + a * (x(ip, j) + x(im, j) + &
+                                        x(i, jp) + x(i, jm))) / (1.0_sp + 4.0_sp * a)
+            call syncthreads()
+        end do
+    end subroutine
+
+    !=========================================================================
+    ! One timestep: swap -> diffuse -> advect
+    !
+    ! This is the Stam "Stable Fluids" ordering for Burgers:
+    ! 1. Copy current to prev
+    ! 2. Diffuse prev -> current (implicit viscosity)
+    ! 3. Swap again (so advection reads from diffused field)
+    ! 4. Advect prev -> current (semi-Lagrangian)
+    !=========================================================================
+    subroutine stam_step(state, dt)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: dt
+
+        integer :: nx_l, ny_l, ierr
+        real(sp) :: a, nu_l
+        type(dim3) :: grid, block
+
+        nx_l = state%nx
+        ny_l = state%ny
+        nu_l = state%nu
+
+        block = dim3(16, 16, 1)
+        grid = dim3((nx_l + 15) / 16, (ny_l + 15) / 16, 1)
+
+        ! Diffusion coefficient
+        a = dt * nu_l * real(nx_l, sp) * real(nx_l, sp)
+
+        ! --- Step 1: Copy current -> prev ---
+        state%u_prev = state%u
+        state%v_prev = state%v
+
+        ! --- Step 2: Diffuse (prev -> current via Jacobi) ---
+        ! Initialize current from prev before iteration
+        state%u = state%u_prev
+        state%v = state%v_prev
+        call diffuse_periodic_kernel<<<grid, block>>>(state%u, state%u_prev, a, nx_l, ny_l)
+        call diffuse_periodic_kernel<<<grid, block>>>(state%v, state%v_prev, a, nx_l, ny_l)
+        ierr = cudaDeviceSynchronize()
+
+        ! --- Step 3: Swap for advection ---
+        state%u_prev = state%u
+        state%v_prev = state%v
+
+        ! --- Step 4: Advect (semi-Lagrangian, self-advection for Burgers) ---
+        call advect_periodic_kernel<<<grid, block>>>( &
+            state%u, state%u_prev, state%u_prev, state%v_prev, dt, nx_l, ny_l)
+        call advect_periodic_kernel<<<grid, block>>>( &
+            state%v, state%v_prev, state%u_prev, state%v_prev, dt, nx_l, ny_l)
+        ierr = cudaDeviceSynchronize()
+    end subroutine
+
+    !=========================================================================
+    ! Run for n_steps
+    !=========================================================================
+    subroutine stam_run(state, dt, n_steps)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: dt
+        integer, intent(in) :: n_steps
+        integer :: step
+
+        do step = 1, n_steps
+            call stam_step(state, dt)
+        end do
+    end subroutine
+
+    !=========================================================================
+    ! Cleanup
+    !=========================================================================
+    subroutine stam_cleanup(state)
+        type(stam_state), intent(inout) :: state
+
+        if (allocated(state%u)) deallocate(state%u)
+        if (allocated(state%v)) deallocate(state%v)
+        if (allocated(state%u_prev)) deallocate(state%u_prev)
+        if (allocated(state%v_prev)) deallocate(state%v_prev)
+    end subroutine
+
+end module stam_solver

@@ -1,0 +1,148 @@
+! realtime_wrapper.cuf - C-binding wrapper for calling both solvers from Python
+!
+! Exposes flat C functions so Python ctypes can drive both solvers
+! and extract fields for CNN correction.
+!
+! Compile:
+!   nvfortran -cuda -gpu=cc89 -O3 -lcufft -shared -fPIC \
+!     spectral_tools.cuf synthetic_turbulence.cuf burgers_solver.cuf \
+!     stam_solver.cuf realtime_wrapper.cuf -o realtime_solvers.so
+
+module realtime_wrapper
+    use iso_c_binding
+    use spectral_tools, only: sp, TWO_PI
+    use synthetic_turbulence
+    use burgers_solver
+    use stam_solver, only: stam_state, stam_init, stam_set_ic, stam_step, &
+                           stam_run, stam_get_u, stam_get_v, stam_cleanup
+    implicit none
+
+    ! Module-level solver states
+    type(burgers_state), save :: spectral_solver
+    type(stam_state), save :: stam_solver_state
+
+    ! Grid params (saved at init)
+    integer, save :: g_nx = 0, g_ny = 0
+
+contains
+
+    !=========================================================================
+    ! Initialize both solvers
+    !=========================================================================
+    subroutine rt_init(nx, ny, nu) bind(c, name='rt_init')
+        integer(c_int), value :: nx, ny
+        real(c_float), value :: nu
+
+        g_nx = nx
+        g_ny = ny
+
+        call burgers_init(spectral_solver, nx, ny, real(nu, sp), TWO_PI, TWO_PI)
+        call stam_init(stam_solver_state, nx, ny, real(nu, sp), TWO_PI, TWO_PI)
+    end subroutine
+
+    !=========================================================================
+    ! Set identical IC in both solvers from a seed
+    ! Generates smooth low-k Kolmogorov IC, normalizes to max|u|=1
+    !=========================================================================
+    subroutine rt_set_ic_from_seed(seed) bind(c, name='rt_set_ic_from_seed')
+        integer(c_int), value :: seed
+
+        real(sp), allocatable :: u_h(:,:), v_h(:,:)
+        real(sp), device, allocatable :: u_d(:,:), v_d(:,:), filt_d(:,:)
+        real(sp) :: k_ic, u_max_val, scale_factor
+
+        allocate(u_h(g_nx, g_ny), v_h(g_nx, g_ny))
+        allocate(u_d(g_nx, g_ny), v_d(g_nx, g_ny), filt_d(g_nx, g_ny))
+
+        k_ic = 16.0_sp
+
+        call generate_kolmogorov_2d(u_d, g_nx, g_ny, seed)
+        call normalize_field_2d(u_d, g_nx, g_ny)
+        call spectral_filter_2d(u_d, filt_d, g_nx, g_ny, k_ic, 0)
+        u_h = filt_d
+
+        call generate_kolmogorov_2d(v_d, g_nx, g_ny, seed + 50000)
+        call normalize_field_2d(v_d, g_nx, g_ny)
+        call spectral_filter_2d(v_d, filt_d, g_nx, g_ny, k_ic, 0)
+        v_h = filt_d
+
+        u_max_val = max(maxval(abs(u_h)), maxval(abs(v_h)))
+        if (u_max_val > 0.0_sp) then
+            scale_factor = 1.0_sp / u_max_val
+            u_h = u_h * scale_factor
+            v_h = v_h * scale_factor
+        end if
+
+        call burgers_set_ic(spectral_solver, u_h, v_h)
+        call stam_set_ic(stam_solver_state, u_h, v_h)
+
+        deallocate(u_h, v_h, u_d, v_d, filt_d)
+    end subroutine
+
+    !=========================================================================
+    ! Step spectral solver by n steps
+    !=========================================================================
+    subroutine rt_step_spectral(dt, n_steps) bind(c, name='rt_step_spectral')
+        real(c_float), value :: dt
+        integer(c_int), value :: n_steps
+
+        call burgers_run(spectral_solver, real(dt, sp), n_steps)
+    end subroutine
+
+    !=========================================================================
+    ! Step Stam solver by n steps
+    !=========================================================================
+    subroutine rt_step_stam(dt, n_steps) bind(c, name='rt_step_stam')
+        real(c_float), value :: dt
+        integer(c_int), value :: n_steps
+
+        call stam_run(stam_solver_state, real(dt, sp), n_steps)
+    end subroutine
+
+    !=========================================================================
+    ! Get fields (copy from device to host)
+    !=========================================================================
+    subroutine rt_get_spectral_u(u_out) bind(c, name='rt_get_spectral_u')
+        real(c_float), intent(out) :: u_out(g_nx, g_ny)
+        real(sp), allocatable :: u_h(:,:)
+
+        allocate(u_h(g_nx, g_ny))
+        call burgers_get_u(spectral_solver, u_h)
+        u_out = u_h
+        deallocate(u_h)
+    end subroutine
+
+    subroutine rt_get_stam_u(u_out) bind(c, name='rt_get_stam_u')
+        real(c_float), intent(out) :: u_out(g_nx, g_ny)
+        real(sp), allocatable :: u_h(:,:)
+
+        allocate(u_h(g_nx, g_ny))
+        call stam_get_u(stam_solver_state, u_h)
+        u_out = u_h
+        deallocate(u_h)
+    end subroutine
+
+    !=========================================================================
+    ! Set Stam u field from host array (for applying CNN correction)
+    !=========================================================================
+    subroutine rt_set_stam_u(u_in) bind(c, name='rt_set_stam_u')
+        real(c_float), intent(in) :: u_in(g_nx, g_ny)
+        real(sp), allocatable :: u_h(:,:)
+
+        allocate(u_h(g_nx, g_ny))
+        u_h = u_in
+        stam_solver_state%u = u_h
+        deallocate(u_h)
+    end subroutine
+
+    !=========================================================================
+    ! Cleanup
+    !=========================================================================
+    subroutine rt_cleanup() bind(c, name='rt_cleanup')
+        call burgers_cleanup(spectral_solver)
+        call stam_cleanup(stam_solver_state)
+        g_nx = 0
+        g_ny = 0
+    end subroutine
+
+end module realtime_wrapper

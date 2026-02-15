@@ -4,6 +4,247 @@ Running record of experiments, observations, and findings.
 
 ---
 
+## 005 - Numerical Error Correction: Stam vs Spectral Solver
+
+**Date**: 2026-02-14
+**Status**: Complete
+
+**Question**: Can a neural network learn to correct the systematic numerical
+error of a fast semi-Lagrangian solver by comparing it to an accurate
+pseudo-spectral solver?
+
+This is a fundamentally different framing from experiments 001-004b. Instead
+of predicting MISSING information (spectral content lost by filtering), we
+predict SYSTEMATIC NUMERICAL ERROR — the difference between a cheap solver
+and an accurate one, run from identical initial conditions.
+
+### Motivation
+
+Experiments 001-004b established that super-resolution fails because fine
+scales depend on evolution history, not the current coarse state. The only
+experiment that worked (002, 12.8%) had a **deterministic local mapping**.
+
+The key insight: numerical dissipation error IS a deterministic local mapping.
+The semi-Lagrangian scheme smears gradients in proportion to local velocity
+and curvature — exactly the kind of coupling CNN excelled at in experiment 002.
+
+### Implementation
+
+**Stam Solver** (`stam_solver.cuf`) — new semi-Lagrangian Burgers solver:
+- Same equation as `burgers_solver.cuf` (2D viscous Burgers)
+- Semi-Lagrangian advection with bilinear interpolation (deliberately dissipative)
+- Implicit Jacobi diffusion (20 iterations)
+- Periodic boundary conditions (matching spectral solver)
+- Single precision (matching spectral lab convention)
+
+**Data Generation** (`experiment_005.cuf`):
+- 128x128 grid, nu=0.01, dt=0.001, 500 steps (t=0.5)
+- Both solvers run from identical ICs (low-k Kolmogorov, max|u|=1)
+- 400 samples, ~250ms/pair, no blowups
+- Output: paired `(stam_sample, spectral_sample)` binary fields
+
+### Results
+
+**Part 1 — Single run diagnostic:**
+- Spectral max|u| = 0.877 (retains structure)
+- Stam max|u| = 0.371 (heavily over-dissipated, ~42% of true amplitude)
+- Error RMS = 0.162, Error max = 0.565
+- The Stam solver loses about 58% of the field amplitude over 500 steps
+
+**Part 2 — Training (400 samples, 80/20 split):**
+
+| Model | Parameters | Training Time | Val Loss | Improvement |
+|-------|-----------|---------------|----------|-------------|
+| CNN   | 19,105    | 28s           | 0.01670  | **40.5%**   |
+| FNO   | 2,367,937 | 95s           | 0.00973  | **65.3%**   |
+
+### Analysis — Why This Works So Well
+
+**40.5% CNN, 65.3% FNO** — dramatically better than any previous experiment.
+The progression tells the complete story:
+
+| Exp | Target | Deterministic? | Best | Why |
+|-----|--------|---------------|------|-----|
+| 001 | Random phases | No | 0% | Nothing to learn |
+| 002 | Gradient texture | Yes (local) | 12.8% CNN | CNN matches local coupling |
+| 003 | PDE fine scales | No | 5.0% | History-dependent |
+| 004 | Temporal context | No | ~1% | Too subtle |
+| 004b | Fixed IC | No | 1.3% | No fixed structure |
+| **005** | **Numerical error** | **Yes (local+global)** | **65.3% FNO** | **Systematic scheme bias** |
+
+Three factors explain the jump:
+
+1. **Deterministic mapping**: Given the same Stam field, the error is always
+   the same. No hidden variables, no history dependence. The error is a
+   function of the current field structure, not the path that got there.
+
+2. **Large, structured signal**: Error RMS ~0.16 (vs residual RMS ~0.05 in
+   exp 003). The Stam solver introduces massive dissipation — there's a lot
+   of learnable signal. The error is spatially structured (concentrated near
+   gradients and steep features), not random noise.
+
+3. **FNO beats CNN for the first time**: In experiment 002, the coupling was
+   purely local (gradients, Laplacian) so CNN with 3x3 kernels was optimal.
+   But numerical dissipation error has **both local AND global** components:
+   - Local: bilinear interpolation smears gradients (CNN-friendly)
+   - Global: accumulated phase errors shift features (FNO-friendly)
+   
+   The FNO's spectral convolutions can capture the global phase error that
+   the CNN's local receptive field cannot reach.
+
+**FNO overfitting note**: Train loss (0.0058) << Val loss (0.0097), suggesting
+the FNO is memorizing some patterns. More data or regularization could
+improve generalization. The CNN shows much less overfitting (0.0168 vs 0.0167).
+
+### Implications
+
+This result validates the core thesis: **ML-corrected fast solvers** are a
+viable approach to getting spectral-quality results at real-time speeds.
+
+The practical application is clear:
+1. Run Stam solver at 60fps (16ms/frame on GPU)
+2. Apply CNN correction in one forward pass (~1ms for 19K params at 128x128)
+3. Get ~40% closer to spectral accuracy at ~59fps
+
+With the FNO (65% correction but more expensive inference), the tradeoff
+shifts — but even a single-pass CNN delivers 40% error reduction.
+
+### Phase 2: Multi-Time Training and Real-Time Correction
+
+**Problem**: The Phase 1 models were trained only on 500-step accumulated
+error. When applied at intermediate times (e.g. step 10), the error is tiny
+but the model applies a 500-step-sized correction → catastrophic overshoot.
+
+Feeding the correction back into the solver caused exponential blowup
+(CNN: max|u| grew from 4.9 at step 10 to infinity by step 430; FNO:
+stabilized around max 140 but never recovered).
+
+**Solution**: Multi-time training. Instead of sampling only at step 500,
+sample at steps {50, 100, 150, 200, 250, 300, 350, 400, 450, 500} per IC.
+This gives 10x more training pairs (4000 total from 400 ICs) and — crucially —
+teaches the model that **correction magnitude scales with error magnitude**.
+
+The model learns this implicitly: at step 50 the Stam field is close to
+spectral, so the correction should be small. At step 500 the error is large,
+so the correction should be large. No explicit time input needed — the
+error magnitude is encoded in the Stam field structure itself.
+
+**Multi-time training results** (4000 pairs, 800 val, 100 epochs):
+
+| Model | Parameters | Training Time | Val Loss | Improvement |
+|-------|-----------|---------------|----------|-------------|
+| CNN   | 19,105    | 298s          | 0.01282  | **39.7%**   |
+| FNO   | 2,367,937 | 1048s         | 0.00404  | **81.0%**   |
+
+The FNO jumps from 65.3% → **81.0%** with multi-time data. The CNN holds
+steady at ~40%. Both models show much less overfitting with 10x more data.
+
+### Real-Time Post-Processing Test
+
+**Setup**: Run both solvers from an unseen IC (seed=9999), apply CNN
+correction as **display post-processing** every 10 steps. The Stam solver
+runs uncorrected internally — corrections are for display only.
+
+**CNN real-time trajectory** (2.8ms per correction, 17% of 60fps budget):
+
+| Step | MSE uncorr | MSE corrected | Improvement |
+|------|-----------|--------------|-------------|
+| 10   | 0.00175   | 0.04283      | -2352% (overcorrects — error too small) |
+| 40   | 0.00893   | 0.01056      | **-18%** (nearly breakeven) |
+| 50   | 0.01075   | 0.00974      | **+9%** (helping!) |
+| 100  | 0.01760   | 0.01164      | **+34%** |
+| 200  | 0.02649   | 0.01612      | **+39%** |
+| 300  | 0.03201   | 0.01848      | **+42%** (peak) |
+| 400  | 0.03565   | 0.02074      | **+42%** |
+| 500  | 0.03827   | 0.02350      | **+39%** |
+
+**FNO real-time trajectory** (4.3ms per correction, 25% of 60fps budget):
+
+| Step | MSE uncorr | MSE corrected | Improvement |
+|------|-----------|--------------|-------------|
+| 10   | 0.00175   | 0.02371      | -1257% (overcorrects, but 30x less than Phase 1) |
+| 30   | 0.00684   | 0.00431      | **+37%** (already helping at step 30!) |
+| 50   | 0.01075   | 0.00391      | **+64%** (peak!) |
+| 100  | 0.01760   | 0.00708      | **+60%** |
+| 200  | 0.02649   | 0.01155      | **+56%** |
+| 300  | 0.03201   | 0.01444      | **+55%** |
+| 400  | 0.03565   | 0.01592      | **+55%** |
+| 500  | 0.03827   | 0.01751      | **+54%** |
+
+**Stability is remarkable**: once the FNO starts helping (step 30), it
+delivers a steady 54-64% improvement for the remaining 470 steps with no
+drift, no oscillation, no blowup. The corrected max|u| tracks spectral
+max|u| closely (0.86-0.88 vs 0.84-0.95).
+
+### Comparison: Phase 1 vs Phase 2
+
+| Model | Phase 1 (500-step only) | Phase 2 (multi-time) |
+|-------|------------------------|---------------------|
+| CNN real-time breakeven | Step 250 | **Step 50** |
+| CNN peak improvement | 42% (step 300+) | **42% (step 300+)** |
+| FNO real-time breakeven | Step 330 | **Step 30** |
+| FNO peak improvement | 62% (step 500) | **64% (step 50!)** |
+| FNO sustained improvement | N/A (grew with time) | **54-64% entire trajectory** |
+
+Multi-time training moved the breakeven point 5-10x earlier without
+sacrificing peak performance. The model learned to scale its corrections.
+
+### What Makes This Work: Three Key Properties
+
+1. **Deterministic error**: Given a Stam field, the error vs spectral is
+   always the same. No hidden variables. This is why exp 002 (deterministic
+   gradient coupling) worked but exp 003 (PDE history) failed.
+
+2. **Error magnitude is self-evident**: The model doesn't need a time input.
+   A heavily dissipated field (step 500, max|u|=0.30) looks different from a
+   slightly dissipated one (step 50, max|u|=0.86). The error magnitude is
+   encoded in the field structure. Multi-time training lets the model see this
+   full range.
+
+3. **Stable post-processing**: Because corrections aren't fed back, there's
+   no feedback instability. The Stam solver runs its own dynamics; the CNN
+   just improves the display output. This is inherently stable.
+
+### Practical Implications
+
+At 128x128 with an RTX 4060:
+- Stam step: ~0.3ms (can run ~50 steps per frame at 60fps)
+- CNN correction: 2.8ms (one per frame)
+- FNO correction: 4.3ms (one per frame)
+- **Total budget used**: CNN 17%, FNO 25% of 16.7ms frame budget
+
+A real-time application would:
+1. Step Stam solver N times per frame (~0.3ms × N)
+2. Extract field to PyTorch tensor
+3. Apply CNN/FNO correction (2.8-4.3ms)
+4. Display corrected field
+5. Continue Stam from uncorrected state next frame
+
+This gives spectral-quality *display* at real-time speed, with the Stam
+solver providing the underlying dynamics.
+
+### Updated Experiment Summary
+
+| Exp | Target | Deterministic? | Best | Why |
+|-----|--------|---------------|------|-----|
+| 001 | Random phases | No | 0% | Nothing to learn |
+| 002 | Gradient texture | Yes (local) | 12.8% CNN | CNN matches local coupling |
+| 003 | PDE fine scales | No | 5.0% | History-dependent |
+| 004 | Temporal context | No | ~1% | Too subtle |
+| 004b | Fixed IC | No | 1.3% | No fixed structure |
+| **005** | **Numerical error** | **Yes** | **81% FNO, 40% CNN** | **Systematic scheme bias** |
+| **005-RT** | **Real-time correction** | **Yes** | **54-64% FNO sustained** | **Multi-time training** |
+
+### Next Steps
+
+- Feed correction back into solver with damping (α × correction, α<1)
+- Deeper CNN to close gap with FNO (try 8 layers, 64 channels)
+- Test at 256x256 (does correction generalize to higher resolution?)
+- Full Navier-Stokes: extend from Burgers to incompressible flow with pressure
+- Integrate with the existing 60fps fluid_dynamics.so for interactive demo
+
+---
+
 ## 003 - Burgers Equation: Physics-Generated Cross-Scale Coupling
 
 **Date**: 2026-02-14
