@@ -1,0 +1,228 @@
+! experiment_004.cuf - Temporal super-resolution: time series -> fine structure
+!
+! Key insight from experiment 003: a single coarse snapshot cannot predict
+! fine-scale PDE-generated structure. The fine structure depends on the
+! nonlinear evolution HISTORY, not just the current state.
+!
+! This experiment tests whether giving the model multiple time snapshots
+! (a coarse time series) enables prediction of the fine structure.
+!
+! Data format per sample:
+!   - N_snap coarse snapshots at regular intervals during evolution
+!   - 1 fine snapshot (full resolution, final state)
+!   - Saved as single binary: [nx, ny, n_snap, coarse_1..coarse_N, fine]
+!
+! The model must learn: coarse(t1, t2, ..., tN) -> fine(tN)
+! This is a VIDEO -> IMAGE task, not IMAGE -> IMAGE.
+
+program experiment_004
+    use cudafor
+    use spectral_tools
+    use synthetic_turbulence
+    use burgers_solver
+    implicit none
+
+    ! Grid size
+    integer, parameter :: nx = 128, ny = 128  ! Smaller grid for faster iteration
+
+    ! Physics — lower viscosity for more fine structure, short evolution
+    real(sp), parameter :: nu = 0.005_sp      ! Lower viscosity -> more nonlinearity
+    real(sp), parameter :: Lx = TWO_PI
+    real(sp), parameter :: Ly = TWO_PI
+    real(sp), parameter :: dt = 0.0005_sp     ! Smaller dt for stability at lower nu
+    integer, parameter :: n_evolve = 400      ! Short evolution (t = 0.2)
+
+    ! Temporal snapshots — capture the steepening process
+    integer, parameter :: n_snap = 8          ! Number of coarse snapshots to save
+    integer, parameter :: snap_interval = n_evolve / n_snap  ! = 50 steps apart
+
+    ! Filter cutoff — aggressive: keep only k<8 in coarse
+    real(sp), parameter :: k_cutoff = 8.0_sp
+
+    ! Training samples
+    integer, parameter :: n_samples = 400
+
+    ! Solver state
+    type(burgers_state) :: solver
+
+    ! Host arrays
+    real(sp), allocatable :: u_h(:,:), snap_h(:,:,:), fine_h(:,:), coarse_h(:,:)
+
+    ! Device arrays for filtering
+    real(sp), device, allocatable :: field_d(:,:), filtered_d(:,:)
+
+    ! Timing
+    type(cudaEvent) :: start_event, stop_event
+    real(4) :: elapsed_ms
+
+    ! Variables
+    integer :: sample, snap_idx, step, ierr
+    real(sp) :: u_max, residual_rms
+    character(len=256) :: filename, output_dir
+
+    ! GPU info
+    type(cudaDeviceProp) :: prop
+    ierr = cudaGetDeviceProperties(prop, 0)
+
+    print *, "================================================================"
+    print *, "  Experiment 004: Temporal Super-Resolution"
+    print *, "================================================================"
+    print *, ""
+    print *, "GPU: ", trim(prop%name)
+    print *, "Grid:", nx, "x", ny
+    print *, "Viscosity:", nu
+    print *, "Evolution:", n_evolve, "steps, dt =", dt
+    print *, "Snapshots:", n_snap, "at interval", snap_interval, "steps"
+    print *, "Filter cutoff: k =", int(k_cutoff)
+    print *, "Samples:", n_samples
+    print *, ""
+
+    output_dir = "../experiments/004_temporal/"
+    call execute_command_line("mkdir -p " // trim(output_dir) // "fields")
+
+    ! Allocate
+    allocate(u_h(nx, ny))
+    allocate(snap_h(nx, ny, n_snap))    ! Coarse snapshots
+    allocate(fine_h(nx, ny), coarse_h(nx, ny))
+    allocate(field_d(nx, ny), filtered_d(nx, ny))
+
+    ierr = cudaEventCreate(start_event)
+    ierr = cudaEventCreate(stop_event)
+
+    ! ==========================================
+    ! Generate training dataset
+    ! ==========================================
+    print *, "--- Generating time-series training data ---"
+    print *, ""
+
+    ierr = cudaEventRecord(start_event, 0)
+
+    do sample = 1, n_samples
+        call burgers_init(solver, nx, ny, nu, Lx, Ly)
+        call generate_smooth_ic(solver, sample * 137 + 7)
+
+        ! Evolve and capture coarse snapshots along the way
+        snap_idx = 0
+        do step = 1, n_evolve
+            call burgers_step_rk4(solver, dt)
+
+            ! Save coarse snapshot at regular intervals
+            if (mod(step, snap_interval) == 0) then
+                snap_idx = snap_idx + 1
+                if (snap_idx <= n_snap) then
+                    call burgers_get_u(solver, u_h)
+                    field_d = u_h
+                    call spectral_filter_2d(field_d, filtered_d, nx, ny, k_cutoff, 0)
+                    snap_h(:,:,snap_idx) = filtered_d
+                end if
+            end if
+        end do
+
+        ! Get final fine field
+        call burgers_get_u(solver, fine_h)
+        u_max = maxval(abs(fine_h))
+
+        ! Check for blowup
+        if (u_max /= u_max .or. u_max > 1.0e6) then
+            if (mod(sample, 50) == 0) then
+                print '(A,I4,A)', "    Sample ", sample, ": SKIPPED (unstable)"
+            end if
+            call burgers_cleanup(solver)
+            cycle
+        end if
+
+        ! Save: [nx, ny, n_snap, snap_1, snap_2, ..., snap_N, fine]
+        write(filename, '(A,A,I4.4,A)') trim(output_dir), "fields/sample_", sample, ".bin"
+        call write_timeseries_sample(trim(filename), snap_h, fine_h, nx, ny, n_snap)
+
+        if (mod(sample, 50) == 0) then
+            ! Compute residual vs last coarse snapshot
+            residual_rms = sqrt(sum((fine_h - snap_h(:,:,n_snap))**2) / real(nx*ny))
+            print '(A,I4,A,I4,A,ES10.3,A,F6.3)', &
+                "    Sample ", sample, " / ", n_samples, &
+                "  residual RMS = ", residual_rms, &
+                "  max|u| = ", u_max
+        end if
+
+        call burgers_cleanup(solver)
+    end do
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+    print *, ""
+    print '(A,I4,A,F8.1,A)', "  Generated ", n_samples, " samples in ", &
+          elapsed_ms / 1000.0, " s"
+    print '(A,F8.1,A)', "  Rate: ", elapsed_ms / real(n_samples), " ms/sample"
+
+    print *, ""
+    print *, "================================================================"
+    print *, "  Experiment 004 Complete"
+    print *, "================================================================"
+    print *, ""
+    print *, "  Data: ", trim(output_dir), "fields/"
+    print *, "  Format: [nx, ny, n_snap, coarse_1..N, fine]"
+    print *, "  Each sample: ", n_snap, " coarse frames + 1 fine target"
+    print *, ""
+
+    deallocate(u_h, snap_h, fine_h, coarse_h, field_d, filtered_d)
+    ierr = cudaEventDestroy(start_event)
+    ierr = cudaEventDestroy(stop_event)
+
+contains
+
+    subroutine generate_smooth_ic(state, seed)
+        type(burgers_state), intent(inout) :: state
+        integer, intent(in) :: seed
+
+        real(sp), allocatable :: u_ic(:,:), v_ic(:,:)
+        real(sp), device, allocatable :: u_d(:,:), v_d(:,:), filt_d(:,:)
+        real(sp) :: k_ic, scale_factor, u_max_val
+        integer :: nx_l, ny_l
+
+        nx_l = state%nx
+        ny_l = state%ny
+        allocate(u_ic(nx_l, ny_l), v_ic(nx_l, ny_l))
+        allocate(u_d(nx_l, ny_l), v_d(nx_l, ny_l), filt_d(nx_l, ny_l))
+
+        k_ic = 16.0_sp
+        call generate_kolmogorov_2d(u_d, nx_l, ny_l, seed)
+        call normalize_field_2d(u_d, nx_l, ny_l)
+        call spectral_filter_2d(u_d, filt_d, nx_l, ny_l, k_ic, 0)
+        u_ic = filt_d
+
+        call generate_kolmogorov_2d(v_d, nx_l, ny_l, seed + 50000)
+        call normalize_field_2d(v_d, nx_l, ny_l)
+        call spectral_filter_2d(v_d, filt_d, nx_l, ny_l, k_ic, 0)
+        v_ic = filt_d
+
+        u_max_val = max(maxval(abs(u_ic)), maxval(abs(v_ic)))
+        if (u_max_val > 0.0_sp) then
+            scale_factor = 1.0_sp / u_max_val
+            u_ic = u_ic * scale_factor
+            v_ic = v_ic * scale_factor
+        end if
+
+        call burgers_set_ic(state, u_ic, v_ic)
+        deallocate(u_ic, v_ic, u_d, v_d, filt_d)
+    end subroutine
+
+    subroutine write_timeseries_sample(filename, snaps, fine, nx, ny, n_snap)
+        character(len=*), intent(in) :: filename
+        real(sp), intent(in) :: snaps(nx, ny, n_snap)
+        real(sp), intent(in) :: fine(nx, ny)
+        integer, intent(in) :: nx, ny, n_snap
+        integer :: unit_num, i
+
+        unit_num = 21
+        open(unit=unit_num, file=filename, form='unformatted', access='stream', status='replace')
+        write(unit_num) nx, ny, n_snap
+        do i = 1, n_snap
+            write(unit_num) snaps(:,:,i)
+        end do
+        write(unit_num) fine
+        close(unit_num)
+    end subroutine
+
+end program experiment_004

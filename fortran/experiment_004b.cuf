@@ -1,0 +1,175 @@
+! experiment_004b.cuf - Fixed IC family: same structure, different evolution times
+!
+! Cryo-EM analogy: in cryo-EM every image shows the SAME protein,
+! just with different noise/orientation. The network learns the protein
+! because it's the consistent signal across all images.
+!
+! Here: we use a SMALL SET of initial conditions but sample each at
+! many different evolution times. The coarse field at time t uniquely
+! determines the fine structure at time t (because it's the same IC).
+! The model can learn "this coarse pattern always produces this fine pattern."
+!
+! Data: for each of N_ic initial conditions, save (coarse, fine) pairs
+! at M different evolution times. Total samples = N_ic * M.
+
+program experiment_004b
+    use cudafor
+    use spectral_tools
+    use synthetic_turbulence
+    use burgers_solver
+    implicit none
+
+    integer, parameter :: nx = 256, ny = 256
+
+    real(sp), parameter :: nu = 0.01_sp
+    real(sp), parameter :: Lx = TWO_PI, Ly = TWO_PI
+    real(sp), parameter :: dt = 0.001_sp
+
+    ! Sample at many time points from a few ICs
+    integer, parameter :: n_ic = 5              ! Number of distinct ICs
+    integer, parameter :: n_times = 60          ! Time samples per IC
+    integer, parameter :: steps_per_sample = 10 ! Steps between samples (dt_save = 0.01)
+    ! Total evolution per IC: 60 * 10 = 600 steps (t = 0.6)
+
+    real(sp), parameter :: k_cutoff = 8.0_sp
+
+    type(burgers_state) :: solver
+    real(sp), allocatable :: u_h(:,:), fine_h(:,:), coarse_h(:,:)
+    real(sp), device, allocatable :: field_d(:,:), filtered_d(:,:)
+    real(sp) :: u_max, residual_rms
+
+    integer :: ic, t_idx, step, sample_num, ierr
+    character(len=256) :: filename, output_dir
+    type(cudaEvent) :: start_event, stop_event
+    real(4) :: elapsed_ms
+
+    type(cudaDeviceProp) :: prop
+    ierr = cudaGetDeviceProperties(prop, 0)
+
+    print *, "================================================================"
+    print *, "  Experiment 004b: Fixed IC Family (Cryo-EM Analogy)"
+    print *, "================================================================"
+    print *, ""
+    print *, "GPU: ", trim(prop%name)
+    print *, "Grid:", nx, "x", ny
+    print *, "ICs:", n_ic, " x ", n_times, " time samples = ", n_ic * n_times, " total"
+    print *, "Steps between samples:", steps_per_sample
+    print *, "Filter cutoff: k =", int(k_cutoff)
+    print *, ""
+
+    output_dir = "../experiments/004b_fixed_ic/"
+    call execute_command_line("mkdir -p " // trim(output_dir) // "fields")
+
+    allocate(u_h(nx, ny), fine_h(nx, ny), coarse_h(nx, ny))
+    allocate(field_d(nx, ny), filtered_d(nx, ny))
+
+    ierr = cudaEventCreate(start_event)
+    ierr = cudaEventCreate(stop_event)
+    ierr = cudaEventRecord(start_event, 0)
+
+    sample_num = 0
+
+    do ic = 1, n_ic
+        call burgers_init(solver, nx, ny, nu, Lx, Ly)
+        call generate_smooth_ic(solver, ic * 1000 + 42)
+
+        print '(A,I2,A)', "  IC ", ic, ":"
+
+        do t_idx = 1, n_times
+            ! Evolve forward
+            do step = 1, steps_per_sample
+                call burgers_step_rk4(solver, dt)
+            end do
+
+            ! Get current state
+            call burgers_get_u(solver, fine_h)
+            u_max = maxval(abs(fine_h))
+
+            ! Check stability
+            if (u_max /= u_max .or. u_max > 1.0e6) then
+                print '(A,I4,A)', "    t_idx ", t_idx, ": UNSTABLE, stopping this IC"
+                exit
+            end if
+
+            ! Filter -> coarse
+            field_d = fine_h
+            call spectral_filter_2d(field_d, filtered_d, nx, ny, k_cutoff, 0)
+            coarse_h = filtered_d
+
+            sample_num = sample_num + 1
+
+            ! Save pair
+            write(filename, '(A,A,I4.4,A)') trim(output_dir), &
+                "fields/fine_sample_", sample_num, ".bin"
+            call write_field_2d(trim(filename), fine_h, nx, ny)
+
+            write(filename, '(A,A,I4.4,A)') trim(output_dir), &
+                "fields/coarse_sample_", sample_num, ".bin"
+            call write_field_2d(trim(filename), coarse_h, nx, ny)
+
+            if (mod(t_idx, 20) == 0) then
+                residual_rms = sqrt(sum((fine_h - coarse_h)**2) / real(nx*ny))
+                print '(A,I4,A,F6.3,A,ES9.2)', &
+                    "    t_idx ", t_idx, ": max|u| = ", u_max, &
+                    "  residual RMS = ", residual_rms
+            end if
+        end do
+
+        call burgers_cleanup(solver)
+    end do
+
+    ierr = cudaEventRecord(stop_event, 0)
+    ierr = cudaEventSynchronize(stop_event)
+    ierr = cudaEventElapsedTime(elapsed_ms, start_event, stop_event)
+
+    print *, ""
+    print '(A,I4,A,F8.1,A)', "  Generated ", sample_num, " pairs in ", &
+          elapsed_ms / 1000.0, " s"
+    print *, ""
+    print *, "  Key property: samples from the SAME IC share consistent"
+    print *, "  coarse-to-fine relationships (like cryo-EM protein images)."
+    print *, ""
+
+    deallocate(u_h, fine_h, coarse_h, field_d, filtered_d)
+    ierr = cudaEventDestroy(start_event)
+    ierr = cudaEventDestroy(stop_event)
+
+contains
+
+    subroutine generate_smooth_ic(state, seed)
+        type(burgers_state), intent(inout) :: state
+        integer, intent(in) :: seed
+
+        real(sp), allocatable :: u_ic(:,:), v_ic(:,:)
+        real(sp), device, allocatable :: u_d(:,:), v_d(:,:), filt_d(:,:)
+        real(sp) :: k_ic, scale_factor, u_max_val
+        integer :: nx_l, ny_l
+
+        nx_l = state%nx
+        ny_l = state%ny
+        allocate(u_ic(nx_l, ny_l), v_ic(nx_l, ny_l))
+        allocate(u_d(nx_l, ny_l), v_d(nx_l, ny_l), filt_d(nx_l, ny_l))
+
+        k_ic = 16.0_sp
+        call generate_kolmogorov_2d(u_d, nx_l, ny_l, seed)
+        call normalize_field_2d(u_d, nx_l, ny_l)
+        call spectral_filter_2d(u_d, filt_d, nx_l, ny_l, k_ic, 0)
+        u_ic = filt_d
+
+        call generate_kolmogorov_2d(v_d, nx_l, ny_l, seed + 50000)
+        call normalize_field_2d(v_d, nx_l, ny_l)
+        call spectral_filter_2d(v_d, filt_d, nx_l, ny_l, k_ic, 0)
+        v_ic = filt_d
+
+        u_max_val = max(maxval(abs(u_ic)), maxval(abs(v_ic)))
+        if (u_max_val > 0.0_sp) then
+            scale_factor = 1.0_sp / u_max_val
+            u_ic = u_ic * scale_factor
+            v_ic = v_ic * scale_factor
+        end if
+
+        call burgers_set_ic(state, u_ic, v_ic)
+        deallocate(u_ic, v_ic, u_d, v_d, filt_d)
+    end subroutine
+
+end program experiment_004b

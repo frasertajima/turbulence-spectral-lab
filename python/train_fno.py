@@ -41,13 +41,29 @@ class TurbulenceDataset(Dataset):
             fine_files = fine_files[:n_samples]
 
         self.samples = []
+        n_skipped = 0
         for fine_file in fine_files:
             sample_id = fine_file.stem.replace("fine_sample_", "")
             coarse_file = self.data_dir / f"coarse_sample_{sample_id}.bin"
             if coarse_file.exists():
-                self.samples.append((coarse_file, fine_file))
+                # Quick NaN check
+                if self._file_is_clean(fine_file) and self._file_is_clean(coarse_file):
+                    self.samples.append((coarse_file, fine_file))
+                else:
+                    n_skipped += 1
 
-        print(f"  Loaded {len(self.samples)} sample pairs from {data_dir}")
+        msg = f"  Loaded {len(self.samples)} sample pairs from {data_dir}"
+        if n_skipped:
+            msg += f" (skipped {n_skipped} with NaN/Inf)"
+        print(msg)
+
+    @staticmethod
+    def _file_is_clean(filepath):
+        with open(filepath, "rb") as f:
+            nx = struct.unpack("i", f.read(4))[0]
+            ny = struct.unpack("i", f.read(4))[0]
+            data = np.frombuffer(f.read(nx * ny * 4), dtype=np.float32)
+            return np.all(np.isfinite(data))
 
     def __len__(self):
         return len(self.samples)
@@ -64,7 +80,7 @@ class TurbulenceDataset(Dataset):
         with open(filepath, "rb") as f:
             nx = struct.unpack("i", f.read(4))[0]
             ny = struct.unpack("i", f.read(4))[0]
-            data = np.frombuffer(f.read(nx * ny * 4), dtype=np.float32)
+            data = np.frombuffer(f.read(nx * ny * 4), dtype=np.float32).copy()
             return data.reshape((ny, nx))
 
 

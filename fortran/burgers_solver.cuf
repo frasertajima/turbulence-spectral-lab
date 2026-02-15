@@ -1,0 +1,475 @@
+! burgers_solver.cuf - 2D viscous Burgers equation solver (pseudo-spectral)
+!
+! Solves:
+!   du/dt + u * du/dx + v * du/dy = nu * (d²u/dx² + d²u/dy²)
+!   dv/dt + u * dv/dx + v * dv/dy = nu * (d²v/dx² + d²v/dy²)
+!
+! Method:
+!   - Spatial derivatives via FFT (spectral accuracy)
+!   - Time integration: RK4 (4th order Runge-Kutta)
+!   - Dealiasing: 2/3 rule (zero padding high modes)
+!   - Periodic boundary conditions
+!
+! Why Burgers: The nonlinear advection u*du/dx creates cross-scale
+! coupling — large scales generate small scales through steepening.
+! This is the simplest model of the turbulent energy cascade.
+! Unlike our synthetic fields, the fine structure is PHYSICALLY
+! determined by the coarse field through the PDE evolution.
+!
+! This module provides the solver; experiment_003.cuf drives it.
+
+module burgers_solver
+    use cudafor
+    use cufft
+    use spectral_tools
+    implicit none
+
+    ! Solver state
+    type :: burgers_state
+        integer :: nx, ny
+        real(sp) :: nu          ! viscosity
+        real(sp) :: Lx, Ly      ! domain size
+        real(sp) :: dx, dy
+
+        ! Fields on device (velocity components)
+        real(sp), device, allocatable :: u(:,:), v(:,:)
+
+        ! Work arrays on device
+        real(sp), device, allocatable :: du(:,:), dv(:,:)
+        real(sp), device, allocatable :: u_tmp(:,:), v_tmp(:,:)
+
+        ! Spectral work arrays
+        complex(sp), device, allocatable :: u_hat(:,:), v_hat(:,:)
+        complex(sp), device, allocatable :: du_hat(:,:), dv_hat(:,:)
+
+        ! Wavenumber arrays (host, copied to device for kernel use)
+        real(sp), device, allocatable :: kx_d(:), ky_d(:)
+
+        ! FFT plans
+        integer :: plan_r2c, plan_c2r
+    end type
+
+contains
+
+    !=========================================================================
+    ! Initialize solver
+    !=========================================================================
+    subroutine burgers_init(state, nx, ny, nu, Lx, Ly)
+        type(burgers_state), intent(inout) :: state
+        integer, intent(in) :: nx, ny
+        real(sp), intent(in) :: nu, Lx, Ly
+
+        integer :: i, nkx, ierr
+        real(sp), allocatable :: kx_h(:), ky_h(:)
+
+        state%nx = nx
+        state%ny = ny
+        state%nu = nu
+        state%Lx = Lx
+        state%Ly = Ly
+        state%dx = Lx / real(nx)
+        state%dy = Ly / real(ny)
+
+        nkx = nx/2 + 1
+
+        ! Allocate device arrays
+        allocate(state%u(nx, ny), state%v(nx, ny))
+        allocate(state%du(nx, ny), state%dv(nx, ny))
+        allocate(state%u_tmp(nx, ny), state%v_tmp(nx, ny))
+        allocate(state%u_hat(nkx, ny), state%v_hat(nkx, ny))
+        allocate(state%du_hat(nkx, ny), state%dv_hat(nkx, ny))
+        allocate(state%kx_d(nkx), state%ky_d(ny))
+
+        ! Build wavenumber arrays
+        allocate(kx_h(nkx), ky_h(ny))
+
+        do i = 1, nkx
+            kx_h(i) = TWO_PI * real(i - 1) / Lx
+        end do
+
+        do i = 1, ny
+            if (i <= ny/2 + 1) then
+                ky_h(i) = TWO_PI * real(i - 1) / Ly
+            else
+                ky_h(i) = TWO_PI * real(i - 1 - ny) / Ly
+            end if
+        end do
+
+        state%kx_d = kx_h
+        state%ky_d = ky_h
+
+        deallocate(kx_h, ky_h)
+
+        ! Create FFT plans
+        ierr = cufftPlan2d(state%plan_r2c, ny, nx, CUFFT_R2C)
+        ierr = cufftPlan2d(state%plan_c2r, ny, nx, CUFFT_C2R)
+
+        ! Zero initial state
+        state%u = 0.0_sp
+        state%v = 0.0_sp
+    end subroutine
+
+    !=========================================================================
+    ! Set initial condition from host arrays
+    !=========================================================================
+    subroutine burgers_set_ic(state, u_h, v_h)
+        type(burgers_state), intent(inout) :: state
+        real(sp), intent(in) :: u_h(state%nx, state%ny)
+        real(sp), intent(in) :: v_h(state%nx, state%ny)
+
+        state%u = u_h
+        state%v = v_h
+    end subroutine
+
+    !=========================================================================
+    ! Compute spectral derivatives on GPU
+    ! Given u_hat, compute du/dx_hat = i*kx*u_hat  (in Fourier space)
+    !=========================================================================
+    attributes(global) subroutine spectral_deriv_x(u_hat, du_hat, kx, nkx, ny)
+        complex(sp), intent(in) :: u_hat(nkx, ny)
+        complex(sp), intent(out) :: du_hat(nkx, ny)
+        real(sp), intent(in) :: kx(nkx)
+        integer, value, intent(in) :: nkx, ny
+
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        ! d/dx in Fourier space: multiply by i*kx
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * kx(i), &
+                               real(u_hat(i,j)) * kx(i))
+    end subroutine
+
+    attributes(global) subroutine spectral_deriv_y(u_hat, du_hat, ky, nkx, ny)
+        complex(sp), intent(in) :: u_hat(nkx, ny)
+        complex(sp), intent(out) :: du_hat(nkx, ny)
+        real(sp), intent(in) :: ky(ny)
+        integer, value, intent(in) :: nkx, ny
+
+        integer :: i, j, idx
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        ! d/dy in Fourier space: multiply by i*ky
+        du_hat(i, j) = cmplx(-aimag(u_hat(i,j)) * ky(j), &
+                               real(u_hat(i,j)) * ky(j))
+    end subroutine
+
+    !=========================================================================
+    ! Dealiasing: zero out modes above 2/3 * k_max (prevents aliasing
+    ! errors from the nonlinear term)
+    !=========================================================================
+    attributes(global) subroutine dealias_2d(u_hat, nkx, ny, kx_max, ky_max)
+        complex(sp), intent(inout) :: u_hat(nkx, ny)
+        integer, value, intent(in) :: nkx, ny
+        real(sp), value, intent(in) :: kx_max, ky_max
+
+        integer :: i, j, idx
+        real(sp) :: ky_val
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        if (j <= ny/2 + 1) then
+            ky_val = real(j - 1)
+        else
+            ky_val = real(ny - j + 1)
+        end if
+
+        if (real(i - 1) > kx_max .or. ky_val > ky_max) then
+            u_hat(i, j) = cmplx(0.0, 0.0)
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Compute RHS of Burgers equation: du/dt = -u*du/dx - v*du/dy + nu*laplacian(u)
+    ! All done in spectral space except the nonlinear products
+    !=========================================================================
+    subroutine burgers_rhs(state, u_in, v_in, rhs_u, rhs_v)
+        type(burgers_state), intent(inout) :: state
+        real(sp), device, intent(in) :: u_in(state%nx, state%ny)
+        real(sp), device, intent(in) :: v_in(state%nx, state%ny)
+        real(sp), device, intent(out) :: rhs_u(state%nx, state%ny)
+        real(sp), device, intent(out) :: rhs_v(state%nx, state%ny)
+
+        integer :: nx, ny, nkx, n_total, n_blocks, ierr, i, j
+        real(sp) :: norm, kx_max, ky_max, nu_local
+
+        ! Derivative work arrays (reuse du_hat, dv_hat)
+        real(sp), device, allocatable :: dudx(:,:), dudy(:,:)
+        real(sp), device, allocatable :: dvdx(:,:), dvdy(:,:)
+        real(sp), device, allocatable :: lap_u(:,:), lap_v(:,:)
+        complex(sp), device, allocatable :: work_hat(:,:), deriv_hat(:,:)
+
+        nx = state%nx
+        ny = state%ny
+        nkx = nx/2 + 1
+        n_total = nkx * ny
+        n_blocks = (n_total + 255) / 256
+        norm = 1.0_sp / real(nx * ny)
+        kx_max = real(nx) / 3.0_sp
+        ky_max = real(ny) / 3.0_sp
+        nu_local = state%nu
+
+        allocate(dudx(nx, ny), dudy(nx, ny), dvdx(nx, ny), dvdy(nx, ny))
+        allocate(lap_u(nx, ny), lap_v(nx, ny))
+        allocate(work_hat(nkx, ny), deriv_hat(nkx, ny))
+
+        ! --- Forward FFT of u ---
+        ierr = cufftExecR2C(state%plan_r2c, u_in, work_hat)
+
+        ! Dealias
+        call dealias_2d<<<n_blocks, 256>>>(work_hat, nkx, ny, kx_max, ky_max)
+
+        ! du/dx
+        call spectral_deriv_x<<<n_blocks, 256>>>(work_hat, deriv_hat, state%kx_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, dudx)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                dudx(i,j) = dudx(i,j) * norm
+            end do
+        end do
+
+        ! du/dy
+        call spectral_deriv_y<<<n_blocks, 256>>>(work_hat, deriv_hat, state%ky_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, dudy)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                dudy(i,j) = dudy(i,j) * norm
+            end do
+        end do
+
+        ! Laplacian of u (in spectral space: -(kx^2+ky^2)*u_hat)
+        call compute_laplacian<<<n_blocks, 256>>>(work_hat, deriv_hat, &
+            state%kx_d, state%ky_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, lap_u)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                lap_u(i,j) = lap_u(i,j) * norm
+            end do
+        end do
+
+        ! --- Forward FFT of v ---
+        ierr = cufftExecR2C(state%plan_r2c, v_in, work_hat)
+
+        ! Dealias
+        call dealias_2d<<<n_blocks, 256>>>(work_hat, nkx, ny, kx_max, ky_max)
+
+        ! dv/dx
+        call spectral_deriv_x<<<n_blocks, 256>>>(work_hat, deriv_hat, state%kx_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, dvdx)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                dvdx(i,j) = dvdx(i,j) * norm
+            end do
+        end do
+
+        ! dv/dy
+        call spectral_deriv_y<<<n_blocks, 256>>>(work_hat, deriv_hat, state%ky_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, dvdy)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                dvdy(i,j) = dvdy(i,j) * norm
+            end do
+        end do
+
+        ! Laplacian of v
+        call compute_laplacian<<<n_blocks, 256>>>(work_hat, deriv_hat, &
+            state%kx_d, state%ky_d, nkx, ny)
+        ierr = cufftExecC2R(state%plan_c2r, deriv_hat, lap_v)
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                lap_v(i,j) = lap_v(i,j) * norm
+            end do
+        end do
+
+        ! --- Assemble RHS: du/dt = -u*dudx - v*dudy + nu*lap_u ---
+        !$cuf kernel do(2) <<<*, *>>>
+        do j = 1, ny
+            do i = 1, nx
+                rhs_u(i,j) = -u_in(i,j)*dudx(i,j) - v_in(i,j)*dudy(i,j) &
+                              + nu_local * lap_u(i,j)
+                rhs_v(i,j) = -u_in(i,j)*dvdx(i,j) - v_in(i,j)*dvdy(i,j) &
+                              + nu_local * lap_v(i,j)
+            end do
+        end do
+
+        deallocate(dudx, dudy, dvdx, dvdy, lap_u, lap_v)
+        deallocate(work_hat, deriv_hat)
+    end subroutine
+
+    !=========================================================================
+    ! Laplacian in spectral space: -(kx^2 + ky^2) * u_hat
+    !=========================================================================
+    attributes(global) subroutine compute_laplacian(u_hat, lap_hat, kx, ky, nkx, ny)
+        complex(sp), intent(in) :: u_hat(nkx, ny)
+        complex(sp), intent(out) :: lap_hat(nkx, ny)
+        real(sp), intent(in) :: kx(nkx), ky(ny)
+        integer, value, intent(in) :: nkx, ny
+
+        integer :: i, j, idx
+        real(sp) :: k2
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nkx * ny) return
+
+        i = mod(idx - 1, nkx) + 1
+        j = (idx - 1) / nkx + 1
+
+        k2 = kx(i)**2 + ky(j)**2
+        lap_hat(i, j) = -k2 * u_hat(i, j)
+    end subroutine
+
+    !=========================================================================
+    ! RK4 time step
+    !=========================================================================
+    subroutine burgers_step_rk4(state, dt)
+        type(burgers_state), intent(inout) :: state
+        real(sp), intent(in) :: dt
+
+        integer :: nx, ny, n_total, n_blocks, ierr
+        real(sp), device, allocatable :: k1u(:,:), k1v(:,:)
+        real(sp), device, allocatable :: k2u(:,:), k2v(:,:)
+        real(sp), device, allocatable :: k3u(:,:), k3v(:,:)
+        real(sp), device, allocatable :: k4u(:,:), k4v(:,:)
+        real(sp), device, allocatable :: u_stage(:,:), v_stage(:,:)
+
+        nx = state%nx
+        ny = state%ny
+        n_total = nx * ny
+        n_blocks = (n_total + 255) / 256
+
+        allocate(k1u(nx,ny), k1v(nx,ny), k2u(nx,ny), k2v(nx,ny))
+        allocate(k3u(nx,ny), k3v(nx,ny), k4u(nx,ny), k4v(nx,ny))
+        allocate(u_stage(nx,ny), v_stage(nx,ny))
+
+        ! k1
+        call burgers_rhs(state, state%u, state%v, k1u, k1v)
+
+        ! k2
+        call rk4_stage<<<n_blocks, 256>>>(u_stage, state%u, k1u, 0.5_sp*dt, nx, ny)
+        call rk4_stage<<<n_blocks, 256>>>(v_stage, state%v, k1v, 0.5_sp*dt, nx, ny)
+        ierr = cudaDeviceSynchronize()
+        call burgers_rhs(state, u_stage, v_stage, k2u, k2v)
+
+        ! k3
+        call rk4_stage<<<n_blocks, 256>>>(u_stage, state%u, k2u, 0.5_sp*dt, nx, ny)
+        call rk4_stage<<<n_blocks, 256>>>(v_stage, state%v, k2v, 0.5_sp*dt, nx, ny)
+        ierr = cudaDeviceSynchronize()
+        call burgers_rhs(state, u_stage, v_stage, k3u, k3v)
+
+        ! k4
+        call rk4_stage<<<n_blocks, 256>>>(u_stage, state%u, k3u, dt, nx, ny)
+        call rk4_stage<<<n_blocks, 256>>>(v_stage, state%v, k3v, dt, nx, ny)
+        ierr = cudaDeviceSynchronize()
+        call burgers_rhs(state, u_stage, v_stage, k4u, k4v)
+
+        ! Update: u += dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+        call rk4_update<<<n_blocks, 256>>>(state%u, k1u, k2u, k3u, k4u, dt, nx, ny)
+        call rk4_update<<<n_blocks, 256>>>(state%v, k1v, k2v, k3v, k4v, dt, nx, ny)
+        ierr = cudaDeviceSynchronize()
+
+        deallocate(k1u, k1v, k2u, k2v, k3u, k3v, k4u, k4v)
+        deallocate(u_stage, v_stage)
+    end subroutine
+
+    !=========================================================================
+    ! GPU kernel: stage = base + coeff * k
+    !=========================================================================
+    attributes(global) subroutine rk4_stage(stage, base, k, coeff, nx, ny)
+        real(sp), intent(out) :: stage(nx, ny)
+        real(sp), intent(in) :: base(nx, ny), k(nx, ny)
+        real(sp), value, intent(in) :: coeff
+        integer, value, intent(in) :: nx, ny
+        integer :: idx, i, j
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nx * ny) return
+        i = mod(idx - 1, nx) + 1
+        j = (idx - 1) / nx + 1
+        stage(i,j) = base(i,j) + coeff * k(i,j)
+    end subroutine
+
+    !=========================================================================
+    ! GPU kernel: u += dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+    !=========================================================================
+    attributes(global) subroutine rk4_update(u, k1, k2, k3, k4, dt, nx, ny)
+        real(sp), intent(inout) :: u(nx, ny)
+        real(sp), intent(in) :: k1(nx, ny), k2(nx, ny), k3(nx, ny), k4(nx, ny)
+        real(sp), value, intent(in) :: dt
+        integer, value, intent(in) :: nx, ny
+        integer :: idx, i, j
+
+        idx = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        if (idx > nx * ny) return
+        i = mod(idx - 1, nx) + 1
+        j = (idx - 1) / nx + 1
+        u(i,j) = u(i,j) + dt / 6.0_sp * &
+            (k1(i,j) + 2.0_sp*k2(i,j) + 2.0_sp*k3(i,j) + k4(i,j))
+    end subroutine
+
+    !=========================================================================
+    ! Run solver for n_steps
+    !=========================================================================
+    subroutine burgers_run(state, dt, n_steps)
+        type(burgers_state), intent(inout) :: state
+        real(sp), intent(in) :: dt
+        integer, intent(in) :: n_steps
+        integer :: step
+
+        do step = 1, n_steps
+            call burgers_step_rk4(state, dt)
+        end do
+    end subroutine
+
+    !=========================================================================
+    ! Get field to host
+    !=========================================================================
+    subroutine burgers_get_u(state, u_h)
+        type(burgers_state), intent(in) :: state
+        real(sp), intent(out) :: u_h(state%nx, state%ny)
+        u_h = state%u
+    end subroutine
+
+    !=========================================================================
+    ! Cleanup
+    !=========================================================================
+    subroutine burgers_cleanup(state)
+        type(burgers_state), intent(inout) :: state
+        integer :: ierr
+
+        if (allocated(state%u)) deallocate(state%u)
+        if (allocated(state%v)) deallocate(state%v)
+        if (allocated(state%du)) deallocate(state%du)
+        if (allocated(state%dv)) deallocate(state%dv)
+        if (allocated(state%u_tmp)) deallocate(state%u_tmp)
+        if (allocated(state%v_tmp)) deallocate(state%v_tmp)
+        if (allocated(state%u_hat)) deallocate(state%u_hat)
+        if (allocated(state%v_hat)) deallocate(state%v_hat)
+        if (allocated(state%du_hat)) deallocate(state%du_hat)
+        if (allocated(state%dv_hat)) deallocate(state%dv_hat)
+        if (allocated(state%kx_d)) deallocate(state%kx_d)
+        if (allocated(state%ky_d)) deallocate(state%ky_d)
+
+        ierr = cufftDestroy(state%plan_r2c)
+        ierr = cufftDestroy(state%plan_c2r)
+    end subroutine
+
+end module burgers_solver
