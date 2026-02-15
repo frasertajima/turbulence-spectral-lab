@@ -128,7 +128,7 @@ def simulation_loop():
 
     # Start in N-S mode with empty field and density tracer
     solver.set_ns_mode(True)
-    solver.enable_density(diffusion=0.0001, decay=0.5)
+    solver.enable_density(diffusion=0.0001, decay=0.05)
     solver.zero_ic()
     models.load_model("fno_ns")
 
@@ -155,7 +155,7 @@ def simulation_loop():
                 solver.cleanup()
                 solver = SolverBridge(NX, NY, NU)
                 solver.set_ns_mode(ns)
-                solver.enable_density(diffusion=0.0001, decay=0.5)
+                solver.enable_density(diffusion=0.0001, decay=0.05)
                 solver.zero_ic()
                 state.ns_mode = ns
                 state.total_steps = 0
