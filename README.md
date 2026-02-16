@@ -3,6 +3,11 @@
 An experimental workbench for exploring spectral methods and neural operators
 applied to turbulence super-resolution.
 
+Videos:
+- [Video 1](https://youtu.be/U0Njc96IzXU?si=XsNl9W7aDg3lmzya)
+- [Video 2](https://youtu.be/VyYG-6TMB0k?si=rz2VlkK4MLedPcgI)
+- [Video 3](https://youtu.be/g0YfFeLQcqc?si=VtEL0LoegzLm1s-W)
+
 ## Motivation
 
 Our emergency response simulation (v44) uses a 2m-cell finite difference solver
