@@ -18,7 +18,7 @@ module realtime_wrapper
     use stam_solver, only: stam_state, stam_init, stam_enable_ns, stam_set_ic, &
                            stam_step, stam_run, stam_get_u, stam_get_v, stam_cleanup, &
                            stam_enable_density, stam_get_rho, stam_set_rho, &
-                           stam_set_walls
+                           stam_set_walls, stam_set_obstacle, stam_set_wind
     implicit none
 
     ! Module-level solver states
@@ -319,6 +319,24 @@ contains
         integer(c_int), value :: use_walls
 
         call stam_set_walls(stam_solver_state, use_walls /= 0)
+    end subroutine
+
+    !=========================================================================
+    ! Set obstacle mask on Stam solver (128x128 int8 array)
+    !=========================================================================
+    subroutine rt_set_obstacle_mask(mask_h) bind(c, name='rt_set_obstacle_mask')
+        integer(c_int8_t), intent(in) :: mask_h(g_nx, g_ny)
+
+        call stam_set_obstacle(stam_solver_state, int(mask_h, kind=1))
+    end subroutine
+
+    !=========================================================================
+    ! Set uniform wind forcing on Stam solver
+    !=========================================================================
+    subroutine rt_set_wind(fx, fy) bind(c, name='rt_set_wind')
+        real(c_float), value :: fx, fy
+
+        call stam_set_wind(stam_solver_state, real(fx, sp), real(fy, sp))
     end subroutine
 
     !=========================================================================

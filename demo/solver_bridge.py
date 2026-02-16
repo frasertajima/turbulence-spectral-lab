@@ -74,6 +74,12 @@ class SolverBridge:
         self.lib.rt_set_walls.argtypes = [_I]
         self.lib.rt_set_walls.restype = None
 
+        self.lib.rt_set_obstacle_mask.argtypes = [ctypes.POINTER(ctypes.c_int8)]
+        self.lib.rt_set_obstacle_mask.restype = None
+
+        self.lib.rt_set_wind.argtypes = [_F, _F]
+        self.lib.rt_set_wind.restype = None
+
         self.lib.rt_cleanup.argtypes = []
         self.lib.rt_cleanup.restype = None
 
@@ -97,6 +103,15 @@ class SolverBridge:
 
     def set_walls(self, enabled: bool):
         self.lib.rt_set_walls(_I(1 if enabled else 0))
+
+    def set_obstacle_mask(self, mask: np.ndarray):
+        # Fortran expects column-major mask(nx, ny) — use F-order
+        mask = np.asfortranarray(mask, dtype=np.int8)
+        ptr = mask.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        self.lib.rt_set_obstacle_mask(ptr)
+
+    def set_wind(self, fx: float, fy: float):
+        self.lib.rt_set_wind(_F(fx), _F(fy))
 
     # --- Stepping ---
 

@@ -38,6 +38,31 @@ STEPS_PER_FRAME = 1
 TARGET_FPS = 60
 
 app = FastAPI(title="Turbulence Spectral Lab - Real-Time Demo")
+
+
+def rasterize_obstacles(
+    obstacles: list[dict], nx: int = 128, ny: int = 128
+) -> np.ndarray:
+    """Convert obstacle shape list to binary mask. Coords are normalized [0,1]."""
+    mask = np.zeros((nx, ny), dtype=np.int8)
+    for obs in obstacles:
+        if obs["type"] == "rect":
+            cx, cy = obs["x"] * nx, obs["y"] * ny
+            hw, hh = obs["w"] * nx / 2, obs["h"] * ny / 2
+            i_min = max(0, int(cx - hw))
+            i_max = min(nx, int(cx + hw))
+            j_min = max(0, int(cy - hh))
+            j_max = min(ny, int(cy + hh))
+            mask[i_min:i_max, j_min:j_max] = 1
+        elif obs["type"] == "circle":
+            cx, cy = obs["x"] * nx, obs["y"] * ny
+            r = obs["r"] * nx
+            ii, jj = np.ogrid[:nx, :ny]
+            dist2 = (ii - cx) ** 2 + (jj - cy) ** 2
+            mask[dist2 <= r * r] = 1
+    return mask
+
+
 WEB_DIR = Path(__file__).parent
 
 
@@ -86,6 +111,8 @@ class SimState:
         self.pending_model_change = None  # str
         self.pending_alpha = None  # float
         self.pending_walls = None  # bool
+        self.pending_obstacles = None  # list of shape dicts
+        self.pending_wind = None  # (fx, fy)
 
         self.running = True
 
@@ -128,7 +155,7 @@ def simulation_loop():
 
     # Start in N-S mode with empty field and density tracer
     solver.set_ns_mode(True)
-    solver.enable_density(diffusion=0.0001, decay=0.05)
+    solver.enable_density(diffusion=0.0001, decay=0.1)
     solver.zero_ic()
     models.load_model("fno_ns")
 
@@ -155,7 +182,7 @@ def simulation_loop():
                 solver.cleanup()
                 solver = SolverBridge(NX, NY, NU)
                 solver.set_ns_mode(ns)
-                solver.enable_density(diffusion=0.0001, decay=0.05)
+                solver.enable_density(diffusion=0.0001, decay=0.1)
                 solver.zero_ic()
                 state.ns_mode = ns
                 state.total_steps = 0
@@ -176,6 +203,16 @@ def simulation_loop():
             if state.pending_walls is not None:
                 solver.set_walls(state.pending_walls)
                 state.pending_walls = None
+
+            if state.pending_obstacles is not None:
+                mask = rasterize_obstacles(state.pending_obstacles, NX, NY)
+                solver.set_obstacle_mask(mask)
+                state.pending_obstacles = None
+
+            if state.pending_wind is not None:
+                fx_w, fy_w = state.pending_wind
+                solver.set_wind(fx_w, fy_w)
+                state.pending_wind = None
 
             if state.pending_force is not None:
                 fx, fy, cx, cy = state.pending_force
@@ -278,6 +315,11 @@ def handle_client_message(msg: dict):
             state.run_spectral = bool(msg["run_spectral"])
         if "walls" in msg:
             state.pending_walls = bool(msg["walls"])
+        if "obstacles" in msg:
+            state.pending_obstacles = msg["obstacles"]
+        if "wind" in msg:
+            w = msg["wind"]
+            state.pending_wind = (float(w["fx"]), float(w["fy"]))
         if "paused" in msg:
             state.paused = bool(msg["paused"])
 

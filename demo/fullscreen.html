@@ -14,9 +14,9 @@
                 overflow: hidden;
                 height: 100vh;
                 width: 100vw;
+                font-family: "Segoe UI", system-ui, sans-serif;
             }
 
-            /* Main canvas fills the viewport */
             #canvas-main {
                 display: block;
                 width: 100vw;
@@ -25,7 +25,120 @@
                 cursor: crosshair;
             }
 
-            /* Floating controls overlay */
+            /* --- Sidebar --- */
+            #sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 200px;
+                height: 100vh;
+                background: rgba(22, 33, 62, 0.92);
+                border-right: 1px solid rgba(100, 120, 160, 0.3);
+                backdrop-filter: blur(8px);
+                padding: 12px;
+                z-index: 20;
+                transition: transform 0.3s;
+                font-size: 13px;
+                color: #ccd;
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            #sidebar.collapsed {
+                transform: translateX(-200px);
+            }
+            #sidebar h3 {
+                font-size: 13px;
+                color: #aab;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin-bottom: 4px;
+            }
+            #sidebar hr {
+                border: none;
+                border-top: 1px solid #334;
+            }
+
+            .shape-card {
+                background: #0f3460;
+                border: 1px solid #446;
+                border-radius: 6px;
+                padding: 8px 10px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                transition: background 0.15s;
+            }
+            .shape-card:hover {
+                background: #1a5276;
+            }
+            .shape-card.active {
+                background: #e94560;
+                border-color: #e94560;
+            }
+            .shape-icon {
+                font-size: 18px;
+            }
+            .shape-label {
+                font-size: 12px;
+            }
+
+            .sidebar-btn {
+                background: #0f3460;
+                color: #e0e0e0;
+                border: 1px solid #446;
+                padding: 5px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                cursor: pointer;
+                width: 100%;
+            }
+            .sidebar-btn:hover {
+                background: #1a5276;
+            }
+
+            .slider-row {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                font-size: 12px;
+            }
+            .slider-row input[type="range"] {
+                flex: 1;
+                min-width: 0;
+            }
+            .slider-row .val {
+                width: 30px;
+                text-align: right;
+                color: #8af;
+                font-weight: 600;
+            }
+
+            #sidebar-tab {
+                position: fixed;
+                top: 50%;
+                left: 0;
+                transform: translateY(-50%);
+                z-index: 25;
+                background: rgba(22, 33, 62, 0.85);
+                border: 1px solid rgba(100, 120, 160, 0.3);
+                border-left: none;
+                border-radius: 0 6px 6px 0;
+                padding: 8px 4px;
+                cursor: pointer;
+                color: #aab;
+                font-size: 11px;
+                writing-mode: vertical-rl;
+                text-orientation: mixed;
+                transition: left 0.3s;
+            }
+            #sidebar:not(.collapsed) ~ #sidebar-tab {
+                left: 200px;
+            }
+
+            /* --- Controls overlay (top-right) --- */
             #controls {
                 position: fixed;
                 top: 12px;
@@ -38,7 +151,6 @@
                 border-radius: 8px;
                 border: 1px solid rgba(100, 120, 160, 0.3);
                 backdrop-filter: blur(8px);
-                font-family: "Segoe UI", system-ui, sans-serif;
                 font-size: 13px;
                 color: #ccd;
                 transition: opacity 0.3s;
@@ -79,7 +191,6 @@
                 align-items: center;
             }
 
-            /* FPS overlay */
             #fps-display {
                 position: fixed;
                 bottom: 12px;
@@ -90,8 +201,6 @@
                 z-index: 10;
                 pointer-events: none;
             }
-
-            /* Toggle hint */
             #hint {
                 position: fixed;
                 bottom: 12px;
@@ -106,6 +215,52 @@
     <body>
         <canvas id="canvas-main" width="128" height="128"></canvas>
 
+        <!-- Sidebar: obstacles + wind -->
+        <div id="sidebar" class="collapsed">
+            <h3>Obstacles</h3>
+            <div class="shape-card" data-shape="rect" id="card-rect">
+                <span class="shape-icon">&#x25AD;</span>
+                <span class="shape-label">Rectangle</span>
+            </div>
+            <div class="shape-card" data-shape="circle" id="card-circle">
+                <span class="shape-icon">&#x25CB;</span>
+                <span class="shape-label">Circle</span>
+            </div>
+            <button class="sidebar-btn" id="btn-clear-obs">
+                Clear Obstacles
+            </button>
+            <hr />
+            <h3>Wind</h3>
+            <div class="slider-row">
+                <span>U:</span>
+                <input
+                    type="range"
+                    id="wind-u"
+                    min="-100"
+                    max="100"
+                    value="0"
+                />
+                <span class="val" id="wind-u-val">0.0000</span>
+            </div>
+            <div class="slider-row">
+                <span>V:</span>
+                <input
+                    type="range"
+                    id="wind-v"
+                    min="-100"
+                    max="100"
+                    value="0"
+                />
+                <span class="val" id="wind-v-val">0.0000</span>
+            </div>
+            <hr />
+            <h3>Scene</h3>
+            <button class="sidebar-btn" id="btn-save-scene">Save Scene</button>
+            <button class="sidebar-btn" id="btn-load-scene">Load Scene</button>
+        </div>
+        <div id="sidebar-tab">Obstacles</div>
+
+        <!-- Controls overlay (top-right) -->
         <div id="controls">
             <div class="row">
                 <button id="btn-clear">Clear</button>
@@ -156,7 +311,7 @@
         </div>
 
         <div id="fps-display">-- fps</div>
-        <div id="hint">Press H to toggle controls</div>
+        <div id="hint">H: controls | Tab: obstacles</div>
 
         <script>
             const NX = 128,
@@ -171,6 +326,14 @@
             let displayMode = "density";
             let isPaused = false;
             let currentFrame = null;
+
+            // --- Obstacle state ---
+            let obstacles = [];
+            let selectedShapeTool = null; // 'rect' or 'circle'
+            let selectedObstacleId = null;
+            let nextObstacleId = 1;
+            let isDraggingObstacle = false;
+            let dragOffset = { x: 0, y: 0 };
 
             // --- Colormaps ---
             function colormap(t) {
@@ -282,11 +445,72 @@
                 return [0, mx || 1];
             }
 
-            // --- Parse binary frame (same protocol as index.html) ---
+            // --- Obstacle rendering (only show selected obstacle) ---
+            function renderObstacles() {
+                if (selectedObstacleId === null) return;
+                const obs = obstacles.find((o) => o.id === selectedObstacleId);
+                if (!obs) return;
+
+                ctx.fillStyle = "rgba(255, 100, 100, 0.3)";
+                ctx.strokeStyle = "#ff4444";
+                ctx.lineWidth = 1;
+
+                if (obs.type === "rect") {
+                    const x = obs.x * NX - (obs.w * NX) / 2;
+                    const y = (1 - obs.y) * NY - (obs.h * NY) / 2;
+                    const w = obs.w * NX;
+                    const h = obs.h * NY;
+                    ctx.fillRect(x, y, w, h);
+                    ctx.strokeRect(x, y, w, h);
+                } else if (obs.type === "circle") {
+                    const cx = obs.x * NX;
+                    const cy = (1 - obs.y) * NY;
+                    const r = obs.r * NX;
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+            }
+
+            // --- Obstacle hit testing ---
+            function hitTestObstacle(nx, ny_sim) {
+                for (let i = obstacles.length - 1; i >= 0; i--) {
+                    const obs = obstacles[i];
+                    if (obs.type === "rect") {
+                        if (
+                            Math.abs(nx - obs.x) < obs.w / 2 &&
+                            Math.abs(ny_sim - obs.y) < obs.h / 2
+                        )
+                            return obs;
+                    } else if (obs.type === "circle") {
+                        const dx = nx - obs.x,
+                            dy = ny_sim - obs.y;
+                        if (dx * dx + dy * dy < obs.r * obs.r) return obs;
+                    }
+                }
+                return null;
+            }
+
+            function sendObstacles() {
+                send({
+                    obstacles: obstacles.map((o) => {
+                        const d = { type: o.type, x: o.x, y: o.y };
+                        if (o.type === "rect") {
+                            d.w = o.w;
+                            d.h = o.h;
+                        } else {
+                            d.r = o.r;
+                        }
+                        return d;
+                    }),
+                });
+            }
+
+            // --- Parse binary frame ---
             function parseFrame(buffer) {
                 const view = new DataView(buffer);
                 let off = 0;
-
                 const frameNumber = view.getInt32(off, true);
                 off += 4;
                 const totalSteps = view.getInt32(off, true);
@@ -299,7 +523,6 @@
                 off += 4;
                 const flags = view.getInt32(off, true);
                 off += 4;
-
                 const hasSpectral = flags & 1;
                 const hasDensity = flags & 2;
 
@@ -317,13 +540,10 @@
                     stamRho = new Float32Array(buffer, off, NX * NY);
                     off += FIELD_BYTES;
                 }
-
                 if (hasSpectral) {
                     off += FIELD_BYTES * 2;
-                } // skip spectral u,v
-
-                // Skip spectrum data
-                off += SPEC_LEN * 4 * 3; // k, e_stam, e_corr
+                }
+                off += SPEC_LEN * 4 * 3;
                 if (hasSpectral) off += SPEC_LEN * 4;
 
                 return {
@@ -337,11 +557,9 @@
                 };
             }
 
-            // --- Render ---
+            // --- Render frame + obstacles ---
             function renderFrame(frame) {
                 currentFrame = frame;
-
-                // Use corrected fields by default (that's the point of fullscreen mode)
                 const selModel = document.getElementById("sel-model").value;
                 const u = selModel === "none" ? frame.stamU : frame.correctedU;
                 const v = selModel === "none" ? frame.stamV : frame.correctedV;
@@ -355,6 +573,7 @@
                     : symRange(field);
 
                 renderField(field, vmin, vmax, cmap);
+                renderObstacles();
 
                 document.getElementById("fps-display").textContent =
                     frame.fps.toFixed(0) + " fps";
@@ -366,9 +585,8 @@
                 ws = new WebSocket(`${proto}//${location.host}/ws`);
                 ws.binaryType = "arraybuffer";
                 ws.onmessage = (evt) => {
-                    if (evt.data instanceof ArrayBuffer) {
+                    if (evt.data instanceof ArrayBuffer)
                         renderFrame(parseFrame(evt.data));
-                    }
                 };
                 ws.onclose = () => setTimeout(connect, 1000);
                 ws.onerror = () => ws.close();
@@ -379,23 +597,88 @@
                     ws.send(JSON.stringify(obj));
             }
 
-            // --- Mouse interaction ---
+            // --- Mouse interaction (3 modes: place, select/drag, force) ---
             let dragging = false,
                 lastX = 0,
                 lastY = 0;
 
             canvas.addEventListener("mousedown", (e) => {
-                dragging = true;
                 const rect = canvas.getBoundingClientRect();
-                lastX = (e.clientX - rect.left) / rect.width;
-                lastY = (e.clientY - rect.top) / rect.height;
+                const nx = (e.clientX - rect.left) / rect.width;
+                const ny = (e.clientY - rect.top) / rect.height;
+                const ny_sim = 1.0 - ny;
+
+                // Mode 1: Place obstacle
+                if (selectedShapeTool) {
+                    const obs =
+                        selectedShapeTool === "rect"
+                            ? {
+                                  type: "rect",
+                                  x: nx,
+                                  y: ny_sim,
+                                  w: 0.15,
+                                  h: 0.08,
+                                  id: nextObstacleId++,
+                              }
+                            : {
+                                  type: "circle",
+                                  x: nx,
+                                  y: ny_sim,
+                                  r: 0.06,
+                                  id: nextObstacleId++,
+                              };
+                    obstacles.push(obs);
+                    selectedObstacleId = obs.id;
+                    selectedShapeTool = null;
+                    document
+                        .querySelectorAll(".shape-card")
+                        .forEach((c) => c.classList.remove("active"));
+                    canvas.style.cursor = "crosshair";
+                    sendObstacles();
+                    return;
+                }
+
+                // Mode 2: Click on existing obstacle
+                const hit = hitTestObstacle(nx, ny_sim);
+                if (hit) {
+                    selectedObstacleId = hit.id;
+                    isDraggingObstacle = true;
+                    dragOffset.x = nx - hit.x;
+                    dragOffset.y = ny_sim - hit.y;
+                    if (currentFrame) renderFrame(currentFrame);
+                    return;
+                }
+
+                // Mode 3: Default force injection
+                selectedObstacleId = null;
+                dragging = true;
+                lastX = nx;
+                lastY = ny;
             });
 
             canvas.addEventListener("mousemove", (e) => {
-                if (!dragging) return;
                 const rect = canvas.getBoundingClientRect();
-                const x = (e.clientX - rect.left) / rect.width;
-                const y = (e.clientY - rect.top) / rect.height;
+                const nx = (e.clientX - rect.left) / rect.width;
+                const ny = (e.clientY - rect.top) / rect.height;
+                const ny_sim = 1.0 - ny;
+
+                // Dragging obstacle
+                if (isDraggingObstacle && selectedObstacleId !== null) {
+                    const obs = obstacles.find(
+                        (o) => o.id === selectedObstacleId,
+                    );
+                    if (obs) {
+                        obs.x = nx - dragOffset.x;
+                        obs.y = ny_sim - dragOffset.y;
+                        sendObstacles();
+                    }
+                    return;
+                }
+
+                // Force injection
+                if (!dragging) return;
+                const x = nx,
+                    y = ny;
                 let fx = (x - lastX) * 5.0;
                 let fy = (y - lastY) * 5.0;
                 const mag = Math.sqrt(fx * fx + fy * fy);
@@ -410,21 +693,54 @@
 
             canvas.addEventListener("mouseup", () => {
                 dragging = false;
+                isDraggingObstacle = false;
             });
             canvas.addEventListener("mouseleave", () => {
                 dragging = false;
+                isDraggingObstacle = false;
             });
 
-            // Touch support for mobile
+            // Touch support
             canvas.addEventListener(
                 "touchstart",
                 (e) => {
                     e.preventDefault();
-                    dragging = true;
                     const rect = canvas.getBoundingClientRect();
                     const t = e.touches[0];
-                    lastX = (t.clientX - rect.left) / rect.width;
-                    lastY = (t.clientY - rect.top) / rect.height;
+                    const nx = (t.clientX - rect.left) / rect.width;
+                    const ny = (t.clientY - rect.top) / rect.height;
+                    const ny_sim = 1.0 - ny;
+
+                    if (selectedShapeTool) {
+                        const obs =
+                            selectedShapeTool === "rect"
+                                ? {
+                                      type: "rect",
+                                      x: nx,
+                                      y: ny_sim,
+                                      w: 0.15,
+                                      h: 0.08,
+                                      id: nextObstacleId++,
+                                  }
+                                : {
+                                      type: "circle",
+                                      x: nx,
+                                      y: ny_sim,
+                                      r: 0.06,
+                                      id: nextObstacleId++,
+                                  };
+                        obstacles.push(obs);
+                        selectedShapeTool = null;
+                        document
+                            .querySelectorAll(".shape-card")
+                            .forEach((c) => c.classList.remove("active"));
+                        sendObstacles();
+                        return;
+                    }
+
+                    dragging = true;
+                    lastX = nx;
+                    lastY = ny;
                 },
                 { passive: false },
             );
@@ -456,7 +772,112 @@
                 dragging = false;
             });
 
-            // --- Controls ---
+            // --- Sidebar toggle ---
+            document.getElementById("sidebar-tab").onclick = () => {
+                document
+                    .getElementById("sidebar")
+                    .classList.toggle("collapsed");
+            };
+
+            // --- Shape card clicks ---
+            document.querySelectorAll(".shape-card").forEach((card) => {
+                card.addEventListener("click", () => {
+                    const shape = card.dataset.shape;
+                    if (selectedShapeTool === shape) {
+                        selectedShapeTool = null;
+                        card.classList.remove("active");
+                        canvas.style.cursor = "crosshair";
+                    } else {
+                        selectedShapeTool = shape;
+                        document
+                            .querySelectorAll(".shape-card")
+                            .forEach((c) => c.classList.remove("active"));
+                        card.classList.add("active");
+                        canvas.style.cursor = "copy";
+                    }
+                });
+            });
+
+            // --- Clear obstacles ---
+            document.getElementById("btn-clear-obs").onclick = () => {
+                obstacles = [];
+                selectedObstacleId = null;
+                sendObstacles();
+            };
+
+            // --- Wind sliders ---
+            function sendWind() {
+                const fx =
+                    parseInt(document.getElementById("wind-u").value) / 10000;
+                const fy =
+                    parseInt(document.getElementById("wind-v").value) / 10000;
+                document.getElementById("wind-u-val").textContent =
+                    fx.toFixed(4);
+                document.getElementById("wind-v-val").textContent =
+                    fy.toFixed(4);
+                send({ wind: { fx: fx, fy: fy } });
+            }
+            document.getElementById("wind-u").oninput = sendWind;
+            document.getElementById("wind-v").oninput = sendWind;
+
+            // --- Scene save/load ---
+            document.getElementById("btn-save-scene").onclick = () => {
+                const scene = {
+                    obstacles: obstacles,
+                    wind: {
+                        fx:
+                            parseInt(document.getElementById("wind-u").value) /
+                            10000,
+                        fy:
+                            parseInt(document.getElementById("wind-v").value) /
+                            10000,
+                    },
+                };
+                const blob = new Blob([JSON.stringify(scene, null, 2)], {
+                    type: "application/json",
+                });
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                const ts = new Date()
+                    .toISOString()
+                    .replace(/[:.]/g, "-")
+                    .slice(0, 19);
+                a.download = `scene_${ts}.json`;
+                a.click();
+                URL.revokeObjectURL(a.href);
+            };
+
+            document.getElementById("btn-load-scene").onclick = () => {
+                const input = document.createElement("input");
+                input.type = "file";
+                input.accept = ".json";
+                input.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (ev) => {
+                        const scene = JSON.parse(ev.target.result);
+                        if (scene.obstacles) {
+                            obstacles = scene.obstacles.map((o) => ({
+                                ...o,
+                                id: nextObstacleId++,
+                            }));
+                            sendObstacles();
+                        }
+                        if (scene.wind) {
+                            document.getElementById("wind-u").value =
+                                Math.round(scene.wind.fx * 10000);
+                            document.getElementById("wind-v").value =
+                                Math.round(scene.wind.fy * 10000);
+                            sendWind();
+                        }
+                    };
+                    reader.readAsText(file);
+                };
+                input.click();
+            };
+
+            // --- Controls (top-right) ---
             document.getElementById("btn-clear").onclick = () =>
                 send({ zero_ic: true });
             document.getElementById("btn-random-ic").onclick = () =>
@@ -490,12 +911,37 @@
                 send({ walls: wallsOn });
             };
 
-            // Toggle controls with H key
+            // --- Keyboard shortcuts ---
             document.addEventListener("keydown", (e) => {
                 if (e.key === "h" || e.key === "H") {
                     document
                         .getElementById("controls")
                         .classList.toggle("hidden");
+                }
+                if (e.key === "Tab") {
+                    e.preventDefault();
+                    document
+                        .getElementById("sidebar")
+                        .classList.toggle("collapsed");
+                }
+                if (
+                    (e.key === "Delete" || e.key === "Backspace") &&
+                    selectedObstacleId !== null
+                ) {
+                    e.preventDefault();
+                    obstacles = obstacles.filter(
+                        (o) => o.id !== selectedObstacleId,
+                    );
+                    selectedObstacleId = null;
+                    sendObstacles();
+                }
+                if (e.key === "Escape") {
+                    selectedShapeTool = null;
+                    selectedObstacleId = null;
+                    document
+                        .querySelectorAll(".shape-card")
+                        .forEach((c) => c.classList.remove("active"));
+                    canvas.style.cursor = "crosshair";
                 }
             });
 

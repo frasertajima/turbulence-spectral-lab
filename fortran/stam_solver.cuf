@@ -51,6 +51,13 @@ module stam_solver
         real(sp) :: diffusion_rho = 0.0_sp   ! density diffusion coefficient
         real(sp) :: decay_rho = 0.0_sp       ! density decay rate (per second)
         real(sp), device, allocatable :: rho(:,:), rho_prev(:,:)
+
+        ! Obstacle mask (0=fluid, 1=obstacle) — always allocated
+        integer(1), device, allocatable :: obstacle(:,:)
+
+        ! Uniform wind forcing (continuous, applied per timestep)
+        real(sp) :: wind_fx = 0.0_sp
+        real(sp) :: wind_fy = 0.0_sp
     end type
 
 contains
@@ -74,11 +81,13 @@ contains
 
         allocate(state%u(nx, ny), state%v(nx, ny))
         allocate(state%u_prev(nx, ny), state%v_prev(nx, ny))
+        allocate(state%obstacle(nx, ny))
 
         state%u = 0.0_sp
         state%v = 0.0_sp
         state%u_prev = 0.0_sp
         state%v_prev = 0.0_sp
+        state%obstacle = 0_1
     end subroutine
 
     !=========================================================================
@@ -104,6 +113,27 @@ contains
         logical, intent(in) :: enabled
 
         state%use_walls = enabled
+    end subroutine
+
+    !=========================================================================
+    ! Set obstacle mask (copy from host to device)
+    !=========================================================================
+    subroutine stam_set_obstacle(state, mask_h)
+        type(stam_state), intent(inout) :: state
+        integer(1), intent(in) :: mask_h(state%nx, state%ny)
+
+        state%obstacle = mask_h
+    end subroutine
+
+    !=========================================================================
+    ! Set uniform wind forcing
+    !=========================================================================
+    subroutine stam_set_wind(state, fx, fy)
+        type(stam_state), intent(inout) :: state
+        real(sp), intent(in) :: fx, fy
+
+        state%wind_fx = fx
+        state%wind_fy = fy
     end subroutine
 
     !=========================================================================
@@ -296,6 +326,48 @@ contains
     end subroutine
 
     !=========================================================================
+    ! Obstacle mask kernel: zero u, v, rho at obstacle cells
+    !=========================================================================
+    attributes(global) subroutine apply_obstacle_kernel(u, v, rho, obstacle, has_rho, nx, ny)
+        real(sp), device, intent(inout) :: u(nx, ny), v(nx, ny), rho(nx, ny)
+        integer(1), device, intent(in) :: obstacle(nx, ny)
+        integer, value, intent(in) :: has_rho, nx, ny
+
+        integer :: i, j
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        if (obstacle(i, j) /= 0_1) then
+            u(i, j) = 0.0_sp
+            v(i, j) = 0.0_sp
+            if (has_rho /= 0) rho(i, j) = 0.0_sp
+        end if
+    end subroutine
+
+    !=========================================================================
+    ! Wind forcing kernel: add uniform wind to non-obstacle cells
+    !=========================================================================
+    attributes(global) subroutine apply_wind_kernel(u, v, obstacle, wfx, wfy, dt, nx, ny)
+        real(sp), device, intent(inout) :: u(nx, ny), v(nx, ny)
+        integer(1), device, intent(in) :: obstacle(nx, ny)
+        real(sp), value, intent(in) :: wfx, wfy, dt
+        integer, value, intent(in) :: nx, ny
+
+        integer :: i, j
+
+        i = (blockIdx%x - 1) * blockDim%x + threadIdx%x
+        j = (blockIdx%y - 1) * blockDim%y + threadIdx%y
+        if (i > nx .or. j > ny) return
+
+        if (obstacle(i, j) == 0_1) then
+            u(i, j) = u(i, j) + wfx * dt
+            v(i, j) = v(i, j) + wfy * dt
+        end if
+    end subroutine
+
+    !=========================================================================
     ! Divergence kernel (periodic BCs)
     ! Computes div = -(du/dx + dv/dy) via central differences
     ! Sign convention matches fluid_dynamics.cuf: div includes the -0.5*h factor
@@ -455,6 +527,13 @@ contains
         call diffuse_periodic_kernel<<<grid, block>>>(state%v, state%v_prev, a, nx_l, ny_l)
         ierr = cudaDeviceSynchronize()
 
+        ! --- Step 2a: Apply wind forcing (before advection) ---
+        if (state%wind_fx /= 0.0_sp .or. state%wind_fy /= 0.0_sp) then
+            call apply_wind_kernel<<<grid, block>>>(state%u, state%v, &
+                state%obstacle, state%wind_fx, state%wind_fy, dt, nx_l, ny_l)
+            ierr = cudaDeviceSynchronize()
+        end if
+
         ! --- Step 2b (N-S only): Project after diffusion ---
         if (state%use_ns) call stam_project(state)
 
@@ -471,6 +550,16 @@ contains
 
         ! --- Step 4b (N-S only): Project after advection ---
         if (state%use_ns) call stam_project(state)
+
+        ! --- Step 4c: Enforce obstacle mask on velocity ---
+        if (state%has_density) then
+            call apply_obstacle_kernel<<<grid, block>>>(state%u, state%v, &
+                state%rho, state%obstacle, 1, nx_l, ny_l)
+        else
+            call apply_obstacle_kernel<<<grid, block>>>(state%u, state%v, &
+                state%u, state%obstacle, 0, nx_l, ny_l)
+        end if
+        ierr = cudaDeviceSynchronize()
 
         ! --- Step 5: Density tracer (passive scalar) ---
         if (state%has_density) then
@@ -494,6 +583,11 @@ contains
                     state%rho, state%decay_rho, dt, nx_l, ny_l)
                 ierr = cudaDeviceSynchronize()
             end if
+
+            ! Zero density that leaked into obstacles
+            call apply_obstacle_kernel<<<grid, block>>>(state%u, state%v, &
+                state%rho, state%obstacle, 1, nx_l, ny_l)
+            ierr = cudaDeviceSynchronize()
         end if
 
         ! --- Step 6: Absorbing boundaries (zero edges so fluid doesn't wrap) ---
@@ -535,6 +629,7 @@ contains
         if (allocated(state%div)) deallocate(state%div)
         if (allocated(state%rho)) deallocate(state%rho)
         if (allocated(state%rho_prev)) deallocate(state%rho_prev)
+        if (allocated(state%obstacle)) deallocate(state%obstacle)
     end subroutine
 
 end module stam_solver
